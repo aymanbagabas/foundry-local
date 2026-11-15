@@ -85,6 +85,7 @@ struct ToolCallContext {
   bool qualified_native_tool_calls = false;
   bool native_qwen_xml_tool_calls = false;
   bool native_tagged_json_tool_calls = false;
+  bool native_tool_history = false;
   std::shared_ptr<const ToolCallPlan> tool_plan;
   std::optional<std::string> tool_body_grammar;
   std::string automatic_retry_instruction;
@@ -175,6 +176,7 @@ struct ToolCallContext {
            custom_lark_grammars == other.custom_lark_grammars && raw_envelope == other.raw_envelope &&
            guidance_disabled == other.guidance_disabled &&
            backend_supports_guidance == other.backend_supports_guidance &&
+           native_tool_history == other.native_tool_history &&
            qualified_native_tool_calls == other.qualified_native_tool_calls &&
            native_qwen_xml_tool_calls == other.native_qwen_xml_tool_calls &&
            native_tagged_json_tool_calls == other.native_tagged_json_tool_calls &&

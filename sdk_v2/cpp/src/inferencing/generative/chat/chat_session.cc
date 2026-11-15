@@ -970,8 +970,25 @@ GuidedToolRetryResult RunGuidedToolRetry(const chat_internal::PreparedChatMessag
   }
   retry_prompt->prompt_token_count = static_cast<int64_t>(retry_prompt->token_ids.size());
 
-  auto generator = CreatePreparedTextChatGenerator(messages, std::move(*retry_prompt), options, model, tool_ctx,
-                                                   /*use_full_context=*/false, factory);
+  std::unique_ptr<ChatGenerator> generator;
+  try {
+    generator = CreatePreparedTextChatGenerator(messages, std::move(*retry_prompt), options, model, tool_ctx,
+                                                /*use_full_context=*/false, factory);
+  } catch (const ContextLengthException& ex) {
+    if (request.IsCancellationRequested()) {
+      GuidedToolRetryResult canceled;
+      canceled.canceled = true;
+      return canceled;
+    }
+    FL_THROW(FOUNDRY_LOCAL_ERROR_INTERNAL, "Private tool-call recovery exceeded context capacity: ", ex.what());
+  } catch (const std::exception&) {
+    if (request.IsCancellationRequested()) {
+      GuidedToolRetryResult canceled;
+      canceled.canceled = true;
+      return canceled;
+    }
+    throw;
+  }
   auto splitter = CreateReasoningSplitter(tool_ctx, model, generator->PromptOpensReasoning());
 
   GuidedToolRetryResult result;
@@ -1005,18 +1022,28 @@ GuidedToolRetryResult RunGuidedToolRetry(const chat_internal::PreparedChatMessag
 
   bool tool_payload_started = native_retry;
   int output_tokens = 0;
-  while (!generator->IsDone() && !request.IsCancellationRequested() && token_boundary_error.empty() &&
-         (!options.max_output_tokens || output_tokens < *options.max_output_tokens)) {
-    generator->GenerateNextToken();
-    ++output_tokens;
-    const auto token_id = generator->CurrentTokenId();
-    auto token =
-        RestoreToolBoundary(generator->Decode(), token_id, tool_ctx, splitter.InsideReasoning(), tool_payload_started);
-    if (!splitter.InsideReasoning() && token_id && token_id == tool_ctx.tool_call_start_token_id) {
-      tool_payload_started = true;
+  try {
+    while (!generator->IsDone() && !request.IsCancellationRequested() && token_boundary_error.empty() &&
+           (!options.max_output_tokens || output_tokens < *options.max_output_tokens)) {
+      generator->GenerateNextToken();
+      ++output_tokens;
+      const auto token_id = generator->CurrentTokenId();
+      auto token =
+          RestoreToolBoundary(generator->Decode(), token_id, tool_ctx, splitter.InsideReasoning(), tool_payload_started);
+      if (!splitter.InsideReasoning() && token_id && token_id == tool_ctx.tool_call_start_token_id) {
+        tool_payload_started = true;
+      }
+      chat_session_internal::DeliverDecodedFragment(std::move(token), token_id, splitter, process_segments,
+                                                    tool_payload_started);
     }
-    chat_session_internal::DeliverDecodedFragment(std::move(token), token_id, splitter, process_segments,
-                                                  tool_payload_started);
+  } catch (const std::exception&) {
+    generator->Cancel();
+    if (request.IsCancellationRequested()) {
+      result.canceled = true;
+      result.events.clear();
+      return result;
+    }
+    throw;
   }
 
   result.canceled = request.IsCancellationRequested();
@@ -1036,14 +1063,24 @@ GuidedToolRetryResult RunGuidedToolRetry(const chat_internal::PreparedChatMessag
     generator->Cancel();
   }
 
-  result.prompt_tokens = generator->PromptTokenCount();
-  result.total_tokens = generator->TokenCount();
-  if (const auto usage = generator->GetTurnUsage()) {
-    result.prompt_tokens = usage->prompt_tokens;
-    result.total_tokens = usage->prompt_tokens + usage->generated_tokens;
-    result.cached_prompt_tokens = usage->cached_prompt_tokens;
-    result.finish_reason = usage->finish_reason;
-    result.termination_cause = usage->termination_cause;
+  try {
+    result.prompt_tokens = generator->PromptTokenCount();
+    result.total_tokens = generator->TokenCount();
+    if (const auto usage = generator->GetTurnUsage()) {
+      result.prompt_tokens = usage->prompt_tokens;
+      result.total_tokens = usage->prompt_tokens + usage->generated_tokens;
+      result.cached_prompt_tokens = usage->cached_prompt_tokens;
+      result.finish_reason = usage->finish_reason;
+      result.termination_cause = usage->termination_cause;
+    }
+  } catch (const std::exception&) {
+    generator->Cancel();
+    if (result.canceled || request.IsCancellationRequested()) {
+      result.canceled = true;
+      result.events.clear();
+      return result;
+    }
+    throw;
   }
 
   const bool canceled_after_usage = result.canceled || request.IsCancellationRequested();
@@ -1325,6 +1362,7 @@ ToolCallContext BuildToolCallContextForRequest(const Request& request,
   tool_ctx.forced_tool = request.forced_tool_choice;
   tool_ctx.raw_envelope = request.raw_envelope_descriptor;
   chat_session_internal::ResolveBuiltInRawEnvelope(tool_ctx);
+  const bool legacy_projection = tool_ctx.raw_envelope.has_value();
 
   // Determine text_output / tool_output from tool_choice parameter.
   // ParseToolChoice rejects unknown values with FOUNDRY_LOCAL_ERROR_INVALID_ARGUMENT.
@@ -1375,6 +1413,19 @@ ToolCallContext BuildToolCallContextForRequest(const Request& request,
 
   chat_session_internal::ApplyRawEnvelopeGuidance(tool_ctx, logger);
   chat_session_internal::SelectSupportedToolProtocol(tool_ctx);
+
+  const bool qualified_projection_markers =
+      tool_ctx.tool_call_start == tag_info.bot_str && tool_ctx.tool_call_end == tag_info.eot_str;
+  if (tool_ctx.HasTools() && tool_ctx.HasToolCallTokens() && qualified_projection_markers && !tool_ctx.forced_tool &&
+      !legacy_projection && !tool_ctx.HasAnyExplicitGuidance() &&
+      tool_choice != FOUNDRY_LOCAL_TOOL_CHOICE_REQUIRED) {
+    tool_ctx.native_tool_history =
+        tool_ctx.tool_output
+            ? tool_ctx.native_qwen_xml_tool_calls || tool_ctx.native_tagged_json_tool_calls
+            : model.HasNativeTaggedJsonToolCalls() ||
+                  (model.HasNativeQwenXmlToolCalls() &&
+                   CanDecodeQwenXmlToolSchemas(tool_ctx.tools_json, tool_ctx.tool_kinds));
+  }
 
   return tool_ctx;
 }
@@ -2073,7 +2124,8 @@ void ChatSession::ProcessRequestImpl(const Request& request, Response& response)
                                      host_output_limit_reached, backend_termination);
   flush_accumulator(natural_tool_output_end);
   emit_visible_text(text_framer.Flush());
-  if (natural_tool_output_end && cached_tool_ctx_.tool_plan && !cached_tool_ctx_.text_output &&
+  if (cached_tool_ctx_.tool_plan && !cached_tool_ctx_.text_output &&
+      (!cached_tool_ctx_.fenced_tool_call_output || natural_tool_output_end) &&
       !cached_tool_ctx_.ActiveRawEnvelope() && !malformed_tool_output_seen &&
       !HasGeneratedToolCalls(generated_events)) {
     malformed_tool_output_seen = true;
@@ -2476,7 +2528,8 @@ void ChatSession::ProcessChatCompletionsJson(PreparedChatRequest& prepared, cons
       active_raw_detector, tool_accumulator, natural_tool_output_end,
       tool_ctx.fenced_tool_call_output));
   emit_visible_text(text_framer.Flush());
-  if (natural_tool_output_end && tool_ctx.tool_plan && !tool_ctx.text_output && !tool_ctx.ActiveRawEnvelope() &&
+  if (tool_ctx.tool_plan && !tool_ctx.text_output && !tool_ctx.ActiveRawEnvelope() &&
+      (!tool_ctx.fenced_tool_call_output || natural_tool_output_end) &&
       !malformed_tool_output_seen && !HasGeneratedToolCalls(generated_events)) {
     malformed_tool_output_seen = true;
     malformed_tool_error = "The model did not emit the required tool call";

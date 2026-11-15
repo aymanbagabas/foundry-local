@@ -192,12 +192,13 @@ uint64_t OnnxChatEngine::BeginTurn(const std::shared_ptr<Conversation>& conversa
               static_cast<uint64_t>(existing_tokens) + static_cast<uint64_t>(tokens.size()) +
               static_cast<uint64_t>(*plan.max_generated_tokens);
           if (total_required > max_request_length_) {
-            FL_THROW(FOUNDRY_LOCAL_ERROR_INVALID_ARGUMENT,
-                     "request requires " + std::to_string(total_required) + " total tokens (" +
-                         std::to_string(existing_tokens) + " existing + " + std::to_string(tokens.size()) +
-                         " input + " + std::to_string(*plan.max_generated_tokens) +
-                         " output), which exceeds the Engine's maximum request length of " +
-                         std::to_string(max_request_length_) + " tokens");
+            throw ContextLengthException(
+                FL_WHERE_WITH_STACK,
+                "request requires " + std::to_string(total_required) + " total tokens (" +
+                    std::to_string(existing_tokens) + " existing + " + std::to_string(tokens.size()) +
+                    " input + " + std::to_string(*plan.max_generated_tokens) +
+                    " output), which exceeds the Engine's maximum request length of " +
+                    std::to_string(max_request_length_) + " tokens");
           }
         }
 

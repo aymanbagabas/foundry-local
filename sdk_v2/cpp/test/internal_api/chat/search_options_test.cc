@@ -121,7 +121,7 @@ TEST(SearchOptionsParsingTest, GeneratorBudgetValidatorMatchesPreflightBoundarie
     if (budget.fits) {
       EXPECT_EQ(ValidateGeneratorRequestBudget(prompt_tokens, 10, 100), 100);
     } else {
-      EXPECT_THROW(ValidateGeneratorRequestBudget(prompt_tokens, 10, 100), fl::Exception);
+      EXPECT_THROW(ValidateGeneratorRequestBudget(prompt_tokens, 10, 100), fl::ContextLengthException);
     }
   }
 

@@ -105,11 +105,12 @@ RequestBudget ComputeRequestBudget(int64_t prompt_tokens,
 int ValidateGeneratorRequestBudget(int64_t prompt_tokens, int max_output_tokens, int context_limit_tokens) {
   const auto budget = ComputeRequestBudget(prompt_tokens, max_output_tokens, context_limit_tokens);
   if (!budget.fits) {
-    FL_THROW(FOUNDRY_LOCAL_ERROR_INVALID_ARGUMENT,
-             "request requires " + std::to_string(budget.required_tokens) + " total tokens (" +
-                 std::to_string(prompt_tokens) + " input + " + std::to_string(max_output_tokens) +
-                 " output), which exceeds the model's maximum context length of " +
-                 std::to_string(context_limit_tokens) + " tokens");
+    throw ContextLengthException(
+        FL_WHERE_WITH_STACK,
+        "request requires " + std::to_string(budget.required_tokens) + " total tokens (" +
+            std::to_string(prompt_tokens) + " input + " + std::to_string(max_output_tokens) +
+            " output), which exceeds the model's maximum context length of " +
+            std::to_string(context_limit_tokens) + " tokens");
   }
 
   return static_cast<int>(budget.required_tokens);

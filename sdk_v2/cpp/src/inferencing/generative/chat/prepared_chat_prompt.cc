@@ -33,7 +33,7 @@ PreparedChatPrompt PrepareTextChatPrompt(const chat_internal::PreparedChatMessag
   }
 
   PreparedChatPrompt prepared;
-  if (tool_ctx.tool_plan && !tool_ctx.HasForcedRawEnvelope()) {
+  if ((tool_ctx.tool_plan || tool_ctx.native_tool_history) && !tool_ctx.HasForcedRawEnvelope()) {
     const auto original = BuildChatMessagesJson(messages.Messages(), tool_ctx.supports_reasoning_history);
     std::string prefix;
     do {
@@ -44,7 +44,8 @@ PreparedChatPrompt PrepareTextChatPrompt(const chat_internal::PreparedChatMessag
     std::unordered_map<std::string, std::string> literals;
     // Keep protected dictionary keys equal to their required-name entries during template evaluation.
     std::unordered_map<std::string, std::string> native_literal_markers;
-    const bool native_literals = tool_ctx.native_qwen_xml_tool_calls || tool_ctx.native_tagged_json_tool_calls;
+    const bool native_literals =
+        tool_ctx.native_tool_history || tool_ctx.native_qwen_xml_tool_calls || tool_ctx.native_tagged_json_tool_calls;
     const std::string serialization_witness = "\\\"\n@";
     const auto json_string_contents = [](const std::string& value) {
       auto encoded = nlohmann::json(value).dump();
@@ -71,7 +72,7 @@ PreparedChatPrompt PrepareTextChatPrompt(const chat_internal::PreparedChatMessag
     };
     std::string projected;
     std::string projected_tools;
-    if (tool_ctx.native_qwen_xml_tool_calls || tool_ctx.native_tagged_json_tool_calls) {
+    if (native_literals) {
       auto projected_json =
           nlohmann::ordered_json::parse(BuildChatMessagesJson(messages.Messages(),
                                                               tool_ctx.supports_reasoning_history));
@@ -96,6 +97,14 @@ PreparedChatPrompt PrepareTextChatPrompt(const chat_internal::PreparedChatMessag
         projected_json.insert(projected_json.begin(),
                               nlohmann::ordered_json{{"role", "system"}, {"content", state}});
       }
+      if (tool_ctx.native_tool_history && !tool_ctx.tool_output) {
+        projected_json.push_back(
+            {{"role", "user"},
+             {"content",
+              "Tools are disabled for this turn. Do not call any tool; "
+              "answer the user's request with ordinary text."}});
+      }
+
       std::function<void(nlohmann::ordered_json&, bool, bool)> protect_json_strings =
           [&](nlohmann::ordered_json& value, bool argument_data, bool dictionary_keys) {
             if (value.is_string()) {
