@@ -561,6 +561,34 @@ TEST(ModelHttpTransportTest, ContextCancellationInterruptsBlockedReadAndDrainsBe
   VerifyBlockedCancellation(false);
 }
 
+void VerifyBlockedDeadline(bool send) {
+  FakeTransport fake;
+  fake.block_send = send;
+  fake.block_read = !send;
+  auto transport = fake.Make()->AzureTransport();
+  const auto context = Azure::Core::Context{}.WithDeadline(Azure::DateTime(std::chrono::system_clock::now() + 20ms));
+  Azure::Core::Http::Request request(Azure::Core::Http::HttpMethod::Get, Azure::Core::Url("https://offline.invalid"));
+  const auto start = std::chrono::steady_clock::now();
+  std::array<uint8_t, 8> buffer{};
+  EXPECT_THROW(
+      {
+        auto response = transport->Send(request, context);
+        response->ExtractBodyStream()->Read(buffer.data(), buffer.size());
+      },
+      Azure::Core::Http::TransportException);
+  EXPECT_LT(std::chrono::steady_clock::now() - start, 1s);
+  EXPECT_EQ(fake.cancelled, 1);
+  EXPECT_EQ(fake.operations_released, 1);
+}
+
+TEST(ModelHttpTransportTest, NativeDeadlineDuringBlockedSendReportsNetworkFailure) {
+  VerifyBlockedDeadline(true);
+}
+
+TEST(ModelHttpTransportTest, NativeDeadlineDuringBlockedReadReportsNetworkFailure) {
+  VerifyBlockedDeadline(false);
+}
+
 TEST(ModelHttpTransportTest, TotalTimeoutInterruptsBlockedSendWithoutRestartingForBody) {
   FakeTransport fake;
   fake.block_send = true;
@@ -600,7 +628,7 @@ TEST(ModelHttpTransportTest, DeadlineCancellationIsStickyAcrossIdleTimeBeforeRea
   ASSERT_EQ(fake.cancelled, 1);
   std::array<uint8_t, 4> buffer{};
   EXPECT_THROW(response->ExtractBodyStream()->Read(buffer.data(), buffer.size()),
-               Azure::Core::OperationCancelledException);
+               Azure::Core::Http::TransportException);
   EXPECT_EQ(fake.reads, 0);
   EXPECT_EQ(fake.operations_released, 1);
 }
