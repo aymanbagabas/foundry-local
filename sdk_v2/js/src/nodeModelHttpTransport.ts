@@ -5,7 +5,6 @@ import * as http from "node:http";
 import * as https from "node:https";
 import type { LookupFunction } from "node:net";
 
-import { ModelHttpLookup } from "./detail/modelHttpLookup.js";
 import type {
   ModelHttpHeader,
   ModelHttpOperation,
@@ -28,10 +27,8 @@ export type NodeModelHttpTransportOptions = {
   readonly httpsAgent?: https.Agent | false;
   /** Advanced routing/testing boundary. Defaults to node:http or node:https based on the request URL. */
   readonly request?: NodeModelHttpRequestFactory;
-  /** Override non-pool DNS resolution. Using node:dns.lookup requires spare libuv pool capacity. */
+  /** Optional application lookup override. By default Node uses the OS resolver and honors the selected Agent. */
   readonly lookup?: LookupFunction;
-  /** DNS servers for the default c-ares resolver, e.g. ["127.0.0.1:5353"]. Does not consult the OS hosts file. */
-  readonly dnsServers?: readonly string[];
 };
 
 /**
@@ -42,10 +39,7 @@ export class NodeModelHttpTransport implements ModelHttpTransport {
   readonly #options: NodeModelHttpTransportOptions;
 
   constructor(options: NodeModelHttpTransportOptions = {}) {
-    this.#options = Object.freeze({
-      ...options,
-      ...(options.dnsServers === undefined ? {} : { dnsServers: Object.freeze([...options.dnsServers]) }),
-    });
+    this.#options = Object.freeze({ ...options });
   }
 
   createOperation(request: ModelHttpRequest): ModelHttpOperation {
@@ -65,7 +59,6 @@ class NodeModelHttpOperation implements ModelHttpOperation {
   #reading = false;
   #wake: (() => void) | undefined;
   #rejectSend: ((error: Error) => void) | undefined;
-  #lookup: ModelHttpLookup | undefined;
   readonly #onAbort = (): void => this.cancel();
   readonly #onResponseError = (): void => this.#fail(new Error("Model HTTP response failed"));
   readonly #onResponseAbort = (): void => this.#fail(new Error("Model HTTP response interrupted"));
@@ -131,18 +124,7 @@ class NodeModelHttpOperation implements ModelHttpOperation {
       const path = target.startsWith("?") ? `/${target}` : target || "/";
       const options: http.RequestOptions = { method: this.#input.method, headers, path };
       if (agent !== undefined) options.agent = agent;
-      const effectiveAgent =
-        agent === undefined ? (url.protocol === "https:" ? https.globalAgent : http.globalAgent) : agent;
-      // Agent.options exists at runtime but is omitted by @types/node on the HTTP Agent base class.
-      const agentOptions =
-        effectiveAgent === false
-          ? undefined
-          : (effectiveAgent as http.Agent & { options?: http.RequestOptions }).options;
       if (this.#options.lookup !== undefined) options.lookup = this.#options.lookup;
-      else if (agentOptions?.lookup === undefined) {
-        this.#lookup = new ModelHttpLookup(this.#options.dnsServers);
-        options.lookup = this.#lookup.lookup;
-      }
       const factory = this.#options.request ?? (url.protocol === "https:" ? https.request : http.request);
       try {
         const request = factory(url, options, (response) => {
@@ -224,7 +206,6 @@ class NodeModelHttpOperation implements ModelHttpOperation {
       this.#request = undefined;
       this.#response = undefined;
       this.#clearTimer();
-      this.#lookup?.cancel();
       return;
     }
     this.#fail(new DOMException("Model HTTP operation closed", "AbortError"));
@@ -244,7 +225,6 @@ class NodeModelHttpOperation implements ModelHttpOperation {
 
   #fail(error: Error): void {
     this.#error ??= error;
-    this.#lookup?.cancel();
     this.#clearTimer();
     this.#rejectSend?.(this.#error);
     this.#rejectSend = undefined;

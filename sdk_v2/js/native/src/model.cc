@@ -181,7 +181,7 @@ Napi::Object SnapshotModelInfo(Napi::Env env, const foundry_local::ModelInfo& in
 // whose keepalive holds the shared ModelList.
 Napi::Array WrapModelList(Napi::Env env, std::shared_ptr<foundry_local::ModelList> list,
                           Napi::ObjectReference manager, std::weak_ptr<foundry_local::Manager> manager_lifetime,
-                          std::shared_ptr<std::atomic_bool> disposed, bool transport) {
+                          std::shared_ptr<std::atomic_bool> disposed, bool transport, bool manager_transport) {
   const auto& models = *list;
   Napi::Array arr = Napi::Array::New(env, models.size());
   for (size_t i = 0; i < models.size(); ++i) {
@@ -191,6 +191,7 @@ Napi::Array WrapModelList(Napi::Env env, std::shared_ptr<foundry_local::ModelLis
     token.manager_lifetime = manager_lifetime;
     token.disposed = disposed;
     token.model_http_transport = transport;
+    token.manager_model_http_transport = manager_transport;
     // Cloning the manager ObjectReference per Model so each entry pins it.
     token.manager = Napi::Reference<Napi::Object>::New(manager.Value(), 1);
     arr.Set(static_cast<uint32_t>(i), Model::NewInstance(env, std::move(token)));
@@ -244,6 +245,7 @@ Model::Model(const Napi::CallbackInfo& info) : Napi::ObjectWrap<Model>(info) {
   disposed_ = std::move(token->disposed);
   manager_ = std::move(token->manager);
   model_http_transport_ = token->model_http_transport;
+  manager_model_http_transport_ = token->manager_model_http_transport;
 }
 
 std::shared_ptr<foundry_local::Manager> Model::LockManager(Napi::Env env) const {
@@ -349,7 +351,8 @@ Napi::Value Model::GetVariants(const Napi::CallbackInfo& info) {
   Napi::ObjectReference owner_clone = Napi::Reference<Napi::Object>::New(manager_.Value(), 1);
   return CallChecked<Napi::Value>(env, [&]() -> Napi::Value {
     auto list = std::make_shared<foundry_local::ModelList>(impl_->GetVariants());
-    return WrapModelList(env, std::move(list), std::move(owner_clone), manager, disposed_, model_http_transport_);
+    return WrapModelList(env, std::move(list), std::move(owner_clone), manager, disposed_, model_http_transport_,
+                         manager_model_http_transport_);
   });
 }
 
@@ -363,8 +366,8 @@ bool Model::MayResolveDefaultVariant() const {
 
 // ── Async lifecycle ─────────────────────────────────────────────────────────
 //
-// Load/Unload/Download dispatch the underlying virtual call onto a libuv
-// worker so the event loop stays responsive. The Model itself is pinned
+// Load/Unload/Download dispatch the underlying virtual call off the event loop. Custom-transport managers use dedicated
+// threads so JavaScript HTTP clients can still use the libuv pool. The Model itself is pinned
 // against GC for the duration of the worker via an ObjectReference to the
 // parent Manager (the Manager owns the catalog whose ModelList views the
 // IModel*).
@@ -380,7 +383,8 @@ Napi::Value Model::Load(const Napi::CallbackInfo& info) {
   Napi::ObjectReference owner = Napi::Reference<Napi::Object>::New(manager_.Value(), 1);
   foundry_local::IModel* m = impl_;
   auto keepalive = keepalive_;
-  return PromiseWorkerVoid::Run(env, [m, manager, keepalive]() { m->Load(); }, std::move(owner));
+  auto policy = TransportExecutionPolicy(manager_model_http_transport_);
+  return PromiseWorkerVoid::Run(env, [m, manager, keepalive]() { m->Load(); }, std::move(owner), {}, policy);
 }
 
 Napi::Value Model::Unload(const Napi::CallbackInfo& info) {
@@ -396,14 +400,14 @@ Napi::Value Model::Unload(const Napi::CallbackInfo& info) {
   Napi::ObjectReference owner = Napi::Reference<Napi::Object>::New(manager_.Value(), 1);
   foundry_local::IModel* m = impl_;
   auto keepalive = keepalive_;
-  return PromiseWorkerVoid::Run(env,
-                                [m, manager, keepalive, worker_start_gate]() {
-                                  if (worker_start_gate) {
-                                    worker_start_gate->SignalAndWait();
-                                  }
-                                  m->Unload();
-                                },
-                                std::move(owner));
+  auto job = [m, manager, keepalive, worker_start_gate]() {
+    if (worker_start_gate) {
+      worker_start_gate->SignalAndWait();
+    }
+    m->Unload();
+  };
+  return PromiseWorkerVoid::Run(env, std::move(job), std::move(owner), {},
+                                TransportExecutionPolicy(manager_model_http_transport_));
 }
 
 namespace {
@@ -434,25 +438,61 @@ class ProgressDispatch {
   bool completed_ = false;
 };
 
-class ProgressDispatchCompletion {
- public:
-  explicit ProgressDispatchCompletion(ProgressDispatch& dispatch) : dispatch_(dispatch) {}
-  ~ProgressDispatchCompletion() { dispatch_.Complete(); }
+struct ProgressState {
+  std::shared_ptr<WorkerEnvironment> environment;
+  Napi::Reference<Napi::Value> callback_error;
+  std::atomic_bool failed = false;
+  std::mutex tsfn_mutex;  // Serialize native admission with forced TSFN finalization.
+  bool released = false;  // Environment thread only.
+  bool finalized = false;
+  std::shared_ptr<std::function<void()>> stop;
+
+  void SetPending(std::shared_ptr<ProgressDispatch> dispatch) {
+    std::lock_guard lock(pending_mutex);
+    pending = std::move(dispatch);
+    if (stopped) pending->Complete();
+  }
+
+  void ClearPending() {
+    std::lock_guard lock(pending_mutex);
+    pending.reset();
+  }
+
+  void Stop() {
+    std::lock_guard lock(pending_mutex);
+    stopped = true;
+    if (pending) pending->Complete();
+  }
+
+  bool Stopped() {
+    std::lock_guard lock(pending_mutex);
+    return stopped;
+  }
 
  private:
-  ProgressDispatch& dispatch_;
+  std::mutex pending_mutex;
+  std::shared_ptr<ProgressDispatch> pending;
+  bool stopped = false;
 };
 
-// AsyncWorker variant that drives IModel::Download with an optional JS
-// progress callback. The callback runs on the libuv worker thread; we bounce
-// each (float percent) to JS via a ThreadSafeFunction acquired before the
-// worker queues and released in OnOK/OnError.
+class ProgressDispatchCompletion {
+ public:
+  explicit ProgressDispatchCompletion(std::shared_ptr<ProgressDispatch> dispatch) : dispatch_(std::move(dispatch)) {}
+  ~ProgressDispatchCompletion() { dispatch_->Complete(); }
+
+ private:
+  std::shared_ptr<ProgressDispatch> dispatch_;
+};
+
+// Progress tickets and callback state outlive the native worker when teardown/cancellation abandons an acknowledgement.
+// The unbounded, nonblocking TSFN queue never pins a native thread inside TSFN admission during environment shutdown.
 class DownloadWorker : public EnvironmentWorker {
  public:
   DownloadWorker(Napi::Env env, foundry_local::IModel* impl, Napi::ObjectReference owner,
                  Napi::ThreadSafeFunction tsfn, std::shared_ptr<std::atomic<bool>> abort_requested,
                  Napi::ObjectReference abort_signal, Napi::FunctionReference abort_listener,
-                 std::shared_ptr<foundry_local::Manager> manager, std::shared_ptr<void> keepalive)
+                 std::shared_ptr<foundry_local::Manager> manager, std::shared_ptr<void> keepalive,
+                 std::shared_ptr<ProgressState> progress)
       : EnvironmentWorker(env),
         deferred_(Napi::Promise::Deferred::New(env)),
         impl_(impl),
@@ -462,9 +502,11 @@ class DownloadWorker : public EnvironmentWorker {
         abort_signal_(std::move(abort_signal)),
         abort_listener_(std::move(abort_listener)),
         manager_(std::move(manager)),
-        keepalive_(std::move(keepalive)) {}
+        keepalive_(std::move(keepalive)),
+        progress_(std::move(progress)) {}
 
   Napi::Promise Promise() { return deferred_.Promise(); }
+  ~DownloadWorker() override { OnShutdown(); }
 
   void Execute() override {
     try {
@@ -475,25 +517,33 @@ class DownloadWorker : public EnvironmentWorker {
           return 1;
         }
         if (tsfn_) {
-          ProgressDispatch dispatch(percent);
-          const napi_status status = tsfn_.BlockingCall(
-              &dispatch, [this](Napi::Env env, Napi::Function js_cb, ProgressDispatch* pending) {
-                ProgressDispatchCompletion completion(*pending);
-                if (env == nullptr || CheckEnvironmentClosing() || js_cb.IsEmpty()) {
-                  return;
-                }
-                try {
-                  js_cb.Call({Napi::Number::New(env, static_cast<double>(pending->Percent()))});
-                } catch (const Napi::Error& error) {
-                  callback_error_ = Napi::Reference<Napi::Value>::New(error.Value(), 1);
-                  callback_failed_.store(true, std::memory_order_release);
-                }
-              });
+          auto dispatch = std::make_shared<ProgressDispatch>(percent);
+          progress_->SetPending(dispatch);
+          napi_status status;
+          {
+            std::lock_guard lock(progress_->tsfn_mutex);
+            if (progress_->finalized || EnvironmentClosing()) return 1;
+            status = tsfn_.NonBlockingCall([state = progress_, dispatch](Napi::Env env, Napi::Function js_cb) {
+              ProgressDispatchCompletion completion(dispatch);
+              if (env == nullptr) state->environment->BeginShutdown();
+              if (env == nullptr || state->environment->CheckClosing() || state->released || state->Stopped() ||
+                  js_cb.IsEmpty()) {
+                return;
+              }
+              try {
+                js_cb.Call({Napi::Number::New(env, static_cast<double>(dispatch->Percent()))});
+              } catch (const Napi::Error& error) {
+                state->callback_error = Napi::Reference<Napi::Value>::New(error.Value(), 1);
+                state->failed.store(true, std::memory_order_release);
+              }
+            });
+          }
           if (status != napi_ok) {
             return 1;
           }
-          dispatch.Wait();
-          if (callback_failed_.load(std::memory_order_acquire)) {
+          dispatch->Wait();
+          progress_->ClearPending();
+          if (progress_->failed.load(std::memory_order_acquire)) {
             return 1;
           }
         }
@@ -522,9 +572,9 @@ class DownloadWorker : public EnvironmentWorker {
   void OnOK() override {
     Napi::HandleScope scope(Env());
     CleanupJsReferences();
-    if (!callback_error_.IsEmpty()) {
-      deferred_.Reject(callback_error_.Value());
-      callback_error_.Reset();
+    if (!progress_->callback_error.IsEmpty()) {
+      deferred_.Reject(progress_->callback_error.Value());
+      progress_->callback_error.Reset();
       return;
     }
     deferred_.Resolve(Env().Undefined());
@@ -534,9 +584,9 @@ class DownloadWorker : public EnvironmentWorker {
     Napi::Env env = Env();
     Napi::HandleScope scope(env);
     CleanupJsReferences();
-    if (!callback_error_.IsEmpty()) {
-      deferred_.Reject(callback_error_.Value());
-      callback_error_.Reset();
+    if (!progress_->callback_error.IsEmpty()) {
+      deferred_.Reject(progress_->callback_error.Value());
+      progress_->callback_error.Reset();
       return;
     }
     if (tagged_) {
@@ -555,8 +605,11 @@ class DownloadWorker : public EnvironmentWorker {
  private:
   void OnShutdown() override {
     // Removing AbortSignal listeners calls JS; only release the native TSFN lease during teardown.
+    progress_->Stop();
     if (tsfn_) {
-      tsfn_.Release();
+      progress_->released = true;
+      std::lock_guard lock(progress_->tsfn_mutex);
+      if (!progress_->finalized) tsfn_.Release();
       tsfn_ = Napi::ThreadSafeFunction();
     }
   }
@@ -577,10 +630,7 @@ class DownloadWorker : public EnvironmentWorker {
       abort_listener_.Reset();
       abort_signal_.Reset();
     }
-    if (tsfn_) {
-      tsfn_.Release();
-      tsfn_ = Napi::ThreadSafeFunction();
-    }
+    OnShutdown();
   }
 
   Napi::Promise::Deferred deferred_;
@@ -590,10 +640,9 @@ class DownloadWorker : public EnvironmentWorker {
   std::shared_ptr<std::atomic<bool>> abort_requested_;
   Napi::ObjectReference abort_signal_;
   Napi::FunctionReference abort_listener_;
-  Napi::Reference<Napi::Value> callback_error_;
   std::shared_ptr<foundry_local::Manager> manager_;
   std::shared_ptr<void> keepalive_;
-  std::atomic<bool> callback_failed_ = false;
+  std::shared_ptr<ProgressState> progress_;
   std::string err_msg_;
   int err_code_ = 0;
   bool tagged_ = false;
@@ -616,6 +665,12 @@ Napi::Value Model::Download(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
+  auto progress = std::make_shared<ProgressState>();
+  progress->environment = env.GetInstanceData<AddonData>()->worker_environment;
+  progress->stop = std::make_shared<std::function<void()>>([weak = std::weak_ptr<ProgressState>(progress)] {
+    if (auto active = weak.lock()) active->Stop();
+  });
+  progress->environment->RegisterShutdown(progress->stop);
   std::shared_ptr<std::atomic<bool>> abort_requested;
   Napi::ObjectReference abort_signal;
   Napi::FunctionReference abort_listener;
@@ -635,8 +690,9 @@ Napi::Value Model::Download(const Napi::CallbackInfo& info) {
 
     abort_requested = std::make_shared<std::atomic<bool>>(aborted.As<Napi::Boolean>().Value());
     Napi::Function listener = Napi::Function::New(
-        env, [abort_requested](const Napi::CallbackInfo&) {
+        env, [abort_requested, progress](const Napi::CallbackInfo&) {
           abort_requested->store(true, std::memory_order_release);
+          progress->Stop();
         });
     add_value.As<Napi::Function>().Call(
         signal, {Napi::String::New(env, "abort"), listener});
@@ -650,14 +706,23 @@ Napi::Value Model::Download(const Napi::CallbackInfo& info) {
   Napi::ThreadSafeFunction tsfn;
   if (info.Length() >= 1 && info[0].IsFunction()) {
     tsfn = Napi::ThreadSafeFunction::New(env, info[0].As<Napi::Function>(), "Model.download.progress",
-                                         /*max_queue_size=*/0, /*initial_thread_count=*/1);
+                                         /*max_queue_size=*/0, /*initial_thread_count=*/1,
+                                         [progress](Napi::Env) {
+                                           {
+                                             std::lock_guard lock(progress->tsfn_mutex);
+                                             progress->finalized = true;
+                                           }
+                                           if (!progress->released) progress->environment->BeginShutdown();
+                                         });
   }
 
   Napi::ObjectReference owner = Napi::Reference<Napi::Object>::New(manager_.Value(), 1);
-  auto* w = new DownloadWorker(env, impl_, std::move(owner), std::move(tsfn), std::move(abort_requested),
-                               std::move(abort_signal), std::move(abort_listener), std::move(manager), keepalive_);
+  auto w = std::make_unique<DownloadWorker>(env, impl_, std::move(owner), std::move(tsfn), std::move(abort_requested),
+                                            std::move(abort_signal), std::move(abort_listener), std::move(manager),
+                                            keepalive_, std::move(progress));
   Napi::Promise p = w->Promise();
-  w->Queue();
+  w->Queue(TransportExecutionPolicy(manager_model_http_transport_));
+  w.release();
   return p;
 }
 

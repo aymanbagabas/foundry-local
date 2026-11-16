@@ -116,6 +116,7 @@ class ChatSession : public Napi::ObjectWrap<ChatSession> {
   std::shared_ptr<foundry_local::Manager> manager_lifetime_;
   std::shared_ptr<std::atomic_bool> manager_disposed_;
   Napi::ObjectReference manager_;
+  bool manager_model_http_transport_ = false;
   std::shared_ptr<foundry_local::ChatSession> impl_;
   std::shared_ptr<SessionScheduler> scheduler_;
 };

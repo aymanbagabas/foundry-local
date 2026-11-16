@@ -346,7 +346,8 @@ Napi::Value Manager::GetCatalogImpl(const Napi::CallbackInfo& info, bool async) 
       };
       auto owner_pin = Napi::Reference<Napi::Object>::New(info.This().As<Napi::Object>(), 1);
       return PromiseWorker<foundry_local::ICatalog*>::Run(
-          env, std::move(get_catalog), std::move(convert), std::move(owner_pin), std::move(check));
+          env, std::move(get_catalog), std::move(convert), std::move(owner_pin), std::move(check),
+          TransportExecutionPolicy(model_http_transport_));
     }
     auto* catalog = get_catalog();
     return convert(env, catalog);

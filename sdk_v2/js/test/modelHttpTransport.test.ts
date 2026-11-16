@@ -211,6 +211,12 @@ describe("public model HTTP transport registration", () => {
       await expect(model.download(() => controller.abort(), controller.signal)).rejects.toMatchObject({
         name: "AbortError",
       });
+      const progressError = new Error("application progress failure");
+      await expect(
+        model.download(() => {
+          throw progressError;
+        }),
+      ).rejects.toBe(progressError);
     } finally {
       manager?.dispose();
       agent.destroy();

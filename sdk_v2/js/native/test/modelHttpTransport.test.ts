@@ -295,7 +295,7 @@ describe("model HTTP native transport bridge", () => {
         directory: workerDirectory,
         libraries,
         block,
-        // More admissions than libuv threads exercises both in-flight and not-yet-executing workers.
+        // Exercise all registered dedicated jobs, including cancellation racing callback admission.
         operations: 8,
       },
     });

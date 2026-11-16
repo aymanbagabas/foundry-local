@@ -45,7 +45,10 @@ struct ModelCtorToken {
   std::shared_ptr<std::atomic_bool> disposed;
   // Pins the parent Manager JavaScript object for wrapper reachability.
   Napi::ObjectReference manager;
+  // Remote-catalog provenance controls sync default-variant guards. Execution policy must instead follow the owning
+  // manager: even local models share its downloader and may reach its transport on a lifecycle operation.
   bool model_http_transport = false;
+  bool manager_model_http_transport = false;
 };
 
 class Model : public Napi::ObjectWrap<Model> {
@@ -68,6 +71,7 @@ class Model : public Napi::ObjectWrap<Model> {
   const std::shared_ptr<std::atomic_bool>& disposed_state() const noexcept { return disposed_; }
   const Napi::ObjectReference& manager() const noexcept { return manager_; }
   bool model_http_transport() const noexcept { return model_http_transport_; }
+  bool manager_model_http_transport() const noexcept { return manager_model_http_transport_; }
   bool MayResolveDefaultVariant() const;
 
  private:
@@ -91,6 +95,7 @@ class Model : public Napi::ObjectWrap<Model> {
   std::shared_ptr<std::atomic_bool> disposed_;
   Napi::ObjectReference manager_;
   bool model_http_transport_ = false;
+  bool manager_model_http_transport_ = false;
 };
 
 }  // namespace foundry_local_node

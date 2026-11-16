@@ -3,8 +3,8 @@
 //
 // Used by asynchronous catalog queries and model load/unload operations.
 //
-// PromiseWorker<T> — generic Napi::AsyncWorker that runs a std::function<T()>
-// on a libuv worker thread and resolves / rejects a JS Promise with the
+// PromiseWorker<T> — generic EnvironmentWorker that runs a std::function<T()>
+// on a policy-selected native thread and resolves / rejects a JS Promise with the
 // result. foundry_local::Error is preserved across the worker boundary so
 // rejections carry the same `name === "FoundryLocalError"` / `code` tags the
 // sync entries produce via errors.cc.
@@ -43,11 +43,12 @@ class PromiseWorker : public EnvironmentWorker {
 
   static Napi::Promise Run(Napi::Env env, Job job, Resolver resolver,
                            Napi::ObjectReference owner = Napi::ObjectReference(),
-                           CompletionCheck completion_check = CompletionCheck()) {
+                           CompletionCheck completion_check = CompletionCheck(),
+                           ExecutionPolicy policy = ExecutionPolicy::Libuv) {
     auto w = std::unique_ptr<PromiseWorker>(
         new PromiseWorker(env, std::move(job), std::move(resolver), std::move(owner), std::move(completion_check)));
     Napi::Promise p = w->deferred_.Promise();
-    w->Queue();
+    w->Queue(policy);
     w.release();
     return p;
   }
@@ -128,11 +129,12 @@ class PromiseWorkerVoid : public EnvironmentWorker {
 
   static Napi::Promise Run(Napi::Env env, Job job,
                            Napi::ObjectReference owner = Napi::ObjectReference(),
-                           Completion completion = Completion()) {
+                           Completion completion = Completion(),
+                           ExecutionPolicy policy = ExecutionPolicy::Libuv) {
     auto w = std::unique_ptr<PromiseWorkerVoid>(
         new PromiseWorkerVoid(env, std::move(job), std::move(owner), std::move(completion)));
     Napi::Promise p = w->deferred_.Promise();
-    w->Queue();
+    w->Queue(policy);
     w.release();
     return p;
   }

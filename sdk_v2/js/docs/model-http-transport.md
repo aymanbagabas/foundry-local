@@ -35,34 +35,31 @@ options, change TLS certificate verification, destroy caller Agents, or add its 
 It owns each ClientRequest/IncomingMessage until operation close. Dispose the manager before destroying shared Agents.
 The transport itself owns no pool or native handle and does not require disposal.
 
-### DNS and native worker concurrency
+### OS DNS and native worker concurrency
 
-The adapter defaults to a per-operation `node:dns.Resolver` (c-ares), not `dns.lookup`. OS `getaddrinfo` uses the same
-libuv worker pool as native SDK jobs: concurrent native calls waiting for JS networking can otherwise occupy every
-slot needed to resolve their own HTTP destinations. The default resolver avoids that dependency, including with
-`UV_THREADPOOL_SIZE=1`. This does not promise starvation freedom for arbitrary caller-supplied networking hooks.
+The adapter leaves Node's default lookup unchanged: `node:dns.lookup` uses the OS resolver, including its hosts-file,
+NSS, search-domain and platform name-resolution policy. The adapter does not inject a resolver, replace OS policy with
+c-ares, or change process-wide DNS settings or `UV_THREADPOOL_SIZE`.
 
-`dnsServers` optionally selects DNS servers (`["127.0.0.1:5353"]`); otherwise Node's configured DNS servers are used.
-The DNS resolver does **not** implement OS hosts-file, NSS, search-domain or mDNS name resolution. Use fully qualified
-DNS names or literal IP addresses. Set `lookup` to a custom Node lookup function, or provide an Agent with its own
-`options.lookup`, to override this behavior. An explicit transport `lookup` takes precedence over the Agent.
-To opt into OS resolution, pass `lookup` imported from `node:dns`, and provision spare libuv pool capacity relative to
-all concurrent native jobs. The adapter does not mutate process-wide DNS settings or `UV_THREADPOOL_SIZE`.
+Set `lookup` to a custom Node lookup function, or provide an Agent with its own lookup, to select application policy.
+An explicit transport `lookup` takes precedence over the Agent. Ordinary Agents and lookups delegating to
+`node:dns.lookup` require no extra pool capacity for native SDK calls waiting on that transport.
 
-The default lookup supports families 0/4/6 (also `"IPv4"`/`"IPv6"`), single and `all` results, and `ADDRCONFIG` based on
-configured non-loopback interfaces. Other getaddrinfo hints are explicitly rejected with `EINVAL`. It preserves each
-DNS answer's address ordering; mixed-family results group A before AAAA, or AAAA first for `order: "ipv6first"`.
-`verbatim` therefore means stable per-family order, not a combined OS resolver order. A successful family remains usable
-when the other returns no records or fails. If neither succeeds, lookup reports `ENOTFOUND`; connection errors exposed
-by the adapter remain credential-free. Both families share the operation deadline. Abort/close cancels outstanding
-DNS queries and ignores late resolution, as well as destroying the actual request.
+Network-capable native jobs owned by a manager with a JS transport execute on registered, joinable dedicated threads,
+not the libuv worker pool needed by OS DNS and other Node clients. This includes catalog acquisition/queries, model
+lifecycle/default-variant work and request preflight. Managers without a custom transport retain their existing libuv
+dispatch. Completion returns through an environment-owned `uv_async_t` queue, without consuming a libuv worker slot.
+
+Abort/close destroys the actual Node request/response and rejects pending adapter work. Node's underlying OS
+`getaddrinfo` request is not independently cancellable by this adapter; late results cannot complete the closed HTTP
+operation. No SDK pool-sizing requirement, DNS policy workaround, added retry, or extra network timeout is involved.
 
 `NodeModelHttpTransportOptions.request` is an optional Node request factory for advanced network routing. It receives
 the connection URL, Node RequestOptions and the response callback; return a normal `http.ClientRequest`. Preserve
 `options.method`, `options.path`, the raw header array and body handling, and do not retry, redirect or decompress.
 The adapter still owns the request, response, abort handling and total deadline. Policy injected by a custom factory or
-Agent is the application's responsibility. Factories receive the default lookup in RequestOptions unless an override
-is selected; a factory that selects a different Agent/lookup should explicitly pass that lookup instead.
+Agent is the application's responsibility. Factories receive a lookup in RequestOptions only when the caller supplied
+an explicit transport `lookup`; otherwise Node and the selected Agent retain their normal lookup behavior.
 Never disable TLS verification as a routing shortcut.
 
 The default factory uses `node:http`/`node:https`, not fetch:
@@ -160,12 +157,18 @@ before scheduling JS abort/cancel; late settlements cannot access freed buffers.
 before cleanup. Environment teardown marks worker admission/completion closed, wakes native waiters and retains the
 async cleanup hook until workers retire, without depending on user Promises settling. Node versions that drain workers
 before cleanup hooks are detected by JS-thread N-API liveness checks. Admitted workers retain shared native-manager leases.
+Dedicated native jobs are registered before launch and joined on the environment thread only after they finish.
+Shutdown closes admission and wakes transport and progress waits without JavaScript, drains completions, and closes the
+completion handle before removing the asynchronous cleanup hook. No thread is detached or forcibly terminated. Native
+operations already running outside an interruptible transport/progress wait still follow the native runtime's own
+cancellation and retry behavior; teardown waits for them to return.
 
 Tests drive the public SDK, real addon/library and real HTTP sockets. They cover complete registry/list/HEAD/range
 acquisition, partial reads/EOF, raw headers, no decompression/redirect/retry, cancellation, deadlines, config immutability,
 native retention, disposal, pending-operation environment termination and API 2/3/4 rejection using a separate test runtime.
-Local UDP DNS tests cover dual-stack resolution, partial failure, DNS abort/deadline, caller lookup overrides and eight
-concurrent real native queries with one- and four-thread libuv pools.
+OS DNS tests observe real `GETADDRINFOREQWRAP` resources, using default Node lookup, ordinary caller Agents, explicit
+lookups delegating to `dns.lookup`, and Agent-owned delegated lookups. Each case requires eight actual concurrent native
+HTTP requests to reach a loopback response barrier with one- and four-thread libuv pools.
 
 ```sh
 npm run test:types

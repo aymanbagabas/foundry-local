@@ -5,6 +5,7 @@
 #include "addon_data.h"
 
 #include <memory>
+#include <utility>
 
 namespace foundry_local_node {
 
@@ -16,6 +17,29 @@ class EnvironmentWorker : public Napi::AsyncWorker {
   }
 
   ~EnvironmentWorker() override { environment_->Retire(); }
+
+  void Queue(ExecutionPolicy policy = ExecutionPolicy::Libuv) {
+    if (environment_->CheckClosing()) throw std::runtime_error("Native worker environment is closing");
+    if (policy == ExecutionPolicy::Libuv) {
+      Napi::AsyncWorker::Queue();
+      return;
+    }
+    // uv_async callbacks have neither a handle scope nor an N-API callback context. Supply both explicitly before
+    // reusing AsyncWorker's completion/error conversion; the async-work object itself is never queued to libuv.
+    auto context = std::make_shared<CompletionContext>(Env());
+    auto complete = [this, context] {
+      Napi::Env env = Env();
+      Napi::HandleScope handles(env);
+      if (CheckEnvironmentClosing()) {
+        OnShutdown();
+        Destroy();
+        return;
+      }
+      Napi::CallbackScope callback(env, context->async);
+      OnWorkComplete(env, napi_ok);
+    };
+    environment_->QueueDedicated([this] { Execute(); }, std::move(complete));
+  }
 
  protected:
   bool EnvironmentClosing() const noexcept { return environment_->closing.load(std::memory_order_acquire); }
@@ -33,6 +57,16 @@ class EnvironmentWorker : public Napi::AsyncWorker {
   }
 
  private:
+  struct CompletionContext {
+    explicit CompletionContext(Napi::Env env)
+        : resource(Napi::Persistent(Napi::Object::New(env))),
+          async(env, "FoundryLocalDedicatedWorker", resource.Value()) {}
+
+    // napi_async_init does not root a supplied async resource. Keep it alive through callback-scope closure.
+    Napi::ObjectReference resource;
+    Napi::AsyncContext async;
+  };
+
   std::shared_ptr<WorkerEnvironment> environment_;
 };
 

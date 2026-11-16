@@ -228,7 +228,7 @@ class Bridge {
           (*root)->cleanup_ = nullptr;
           (*root)->cleanup_root_ = nullptr;
           // Completions can run during RunCleanup as soon as Stop wakes native waits. Block JS before that happens.
-          (*root)->environment_->closing.store(true, std::memory_order_release);
+          (*root)->environment_->BeginShutdown();
           // Waking native waiters never needs JS, Promise settlement, or a libuv worker-pool slot.
           (*root)->Stop(true);
           // The environment-wide worker hook stays registered until all admitted workers have retired.
@@ -241,6 +241,10 @@ class Bridge {
       bridge->Stop(true);
       throw std::runtime_error("Unable to register model HTTP transport cleanup hook");
     }
+    bridge->stop_ = std::make_shared<std::function<void()>>([weak = std::weak_ptr<Bridge>(bridge)] {
+      if (auto active = weak.lock()) active->Stop(true);
+    });
+    bridge->environment_->RegisterShutdown(bridge->stop_);
     return bridge;
   }
 
@@ -297,8 +301,8 @@ class Bridge {
     }
     if (forced) {
       // Node may finalize the TSFN before our async hook runs. Its already-delivered tickets still need waking.
-      environment_->closing.store(true, std::memory_order_release);
       Stop(true, false);  // The TSFN itself is already finalized: never release it again.
+      environment_->BeginShutdown();
     }
     RemoveCleanupHook();
   }
@@ -331,7 +335,7 @@ class Bridge {
   static void CallJs(napi_env raw_env, napi_value raw_callback, void*, void* data) noexcept {
     std::unique_ptr<Event> event(static_cast<Event*>(data));
     auto environment = event->operation->bridge->environment_;
-    if (!raw_env || !raw_callback) environment->closing.store(true, std::memory_order_release);
+    if (!raw_env || !raw_callback) environment->BeginShutdown();
     if (!raw_env || !raw_callback || environment->CheckClosing()) {
       // Some Node releases drain native work before running cleanup hooks. Stop from this TSFN turn instead.
       event->operation->bridge->Stop(true);
@@ -413,6 +417,7 @@ class Bridge {
   napi_threadsafe_function tsfn_ = nullptr;
   napi_async_cleanup_hook_handle cleanup_ = nullptr;
   std::shared_ptr<WorkerEnvironment> environment_;
+  std::shared_ptr<std::function<void()>> stop_;
   std::shared_ptr<Bridge>* cleanup_root_ = nullptr;  // Removed on the environment thread, never by native Release.
   std::vector<std::weak_ptr<Operation>> operations_;
   size_t active_js_operations_ = 0;  // JS thread only; idle transports must not keep Node alive.

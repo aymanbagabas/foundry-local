@@ -418,12 +418,12 @@ class RequestPreflightWorker : public EnvironmentWorker {
  public:
   static Napi::Promise Run(Napi::Env env, std::shared_ptr<foundry_local::RequestPreflight> preflight,
                            std::shared_ptr<foundry_local::Manager> manager_lifetime,
-                           Napi::ObjectReference manager) {
+                           Napi::ObjectReference manager, ExecutionPolicy policy) {
     auto* worker = new RequestPreflightWorker(env, std::move(preflight), std::move(manager_lifetime),
                                               std::move(manager));
     Napi::Promise promise = worker->deferred_.Promise();
     try {
-      worker->Queue();
+      worker->Queue(policy);
     } catch (const std::exception& e) {
       worker->FailBeforeQueue(e.what());
     } catch (...) {
@@ -999,6 +999,7 @@ ChatSession::ChatSession(const Napi::CallbackInfo& info)
     if (model->model_http_transport() && model->MayResolveDefaultVariant() &&
         RejectSyncModelHttpTransport(env, true)) return;
     impl_ = std::make_shared<foundry_local::ChatSession>(*native);
+    manager_model_http_transport_ = model->manager_model_http_transport();
   } catch (const foundry_local::Error& e) {
     ThrowFoundryLocalError(env, static_cast<int>(e.Code()), e.what());
     return;
@@ -1071,7 +1072,8 @@ Napi::Value ChatSession::PreflightRequest(const Napi::CallbackInfo& info) {
 
   // Capture owns the request/session snapshot; only the Manager runtime must remain alive.
   Napi::ObjectReference manager_ref = Napi::Reference<Napi::Object>::New(manager_.Value(), 1);
-  return RequestPreflightWorker::Run(env, std::move(preflight), manager_lifetime_, std::move(manager_ref));
+  return RequestPreflightWorker::Run(env, std::move(preflight), manager_lifetime_, std::move(manager_ref),
+                                     TransportExecutionPolicy(manager_model_http_transport_));
 }
 
 Napi::Value ChatSession::ProcessStreamingRequest(const Napi::CallbackInfo& info) {

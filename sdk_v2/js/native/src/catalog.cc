@@ -25,7 +25,8 @@ namespace {
 // passed-in manager reference.
 Napi::Value WrapModelList(Napi::Env env, foundry_local::ModelList ml, Napi::ObjectReference manager,
                           std::weak_ptr<foundry_local::Manager> manager_lifetime,
-                          std::shared_ptr<std::atomic_bool> disposed, bool transport) {
+                          std::shared_ptr<std::atomic_bool> disposed, bool transport,
+                          bool manager_transport) {
   auto list = std::make_shared<foundry_local::ModelList>(std::move(ml));
   const auto& models = *list;
   Napi::Array arr = Napi::Array::New(env, models.size());
@@ -36,6 +37,7 @@ Napi::Value WrapModelList(Napi::Env env, foundry_local::ModelList ml, Napi::Obje
     token.manager_lifetime = manager_lifetime;
     token.disposed = disposed;
     token.model_http_transport = transport;
+    token.manager_model_http_transport = manager_transport;
     token.manager = Napi::Reference<Napi::Object>::New(manager.Value(), 1);
     arr.Set(static_cast<uint32_t>(i), Model::NewInstance(env, std::move(token)));
   }
@@ -46,7 +48,7 @@ Napi::Value WrapModelList(Napi::Env env, foundry_local::ModelList ml, Napi::Obje
 Napi::Value WrapOwnedModelOrUndefined(Napi::Env env, std::unique_ptr<foundry_local::IModel> owned,
                                       Napi::ObjectReference manager,
                                       std::weak_ptr<foundry_local::Manager> manager_lifetime,
-                                      std::shared_ptr<std::atomic_bool> disposed, bool transport) {
+                                      std::shared_ptr<std::atomic_bool> disposed, bool transport, bool manager_transport) {
   if (!owned) {
     return env.Undefined();
   }
@@ -59,6 +61,7 @@ Napi::Value WrapOwnedModelOrUndefined(Napi::Env env, std::unique_ptr<foundry_loc
   token.manager_lifetime = std::move(manager_lifetime);
   token.disposed = std::move(disposed);
   token.model_http_transport = transport;
+  token.manager_model_http_transport = manager_transport;
   token.manager = std::move(manager);
   return Model::NewInstance(env, std::move(token));
 }
@@ -176,7 +179,8 @@ Napi::Value Catalog::GetModels(const Napi::CallbackInfo& info) {
   }
   Napi::ObjectReference mgr = CloneManager(manager_);
   return CallChecked<Napi::Value>(env, [&]() -> Napi::Value {
-    return WrapModelList(env, catalog_->GetModels(), std::move(mgr), manager, disposed_, remote_model_http_transport_);
+    return WrapModelList(env, catalog_->GetModels(), std::move(mgr), manager, disposed_, remote_model_http_transport_,
+                         model_http_transport_);
   });
 }
 
@@ -190,7 +194,7 @@ Napi::Value Catalog::GetCachedModels(const Napi::CallbackInfo& info) {
   Napi::ObjectReference mgr = CloneManager(manager_);
   return CallChecked<Napi::Value>(env, [&]() -> Napi::Value {
     return WrapModelList(env, catalog_->GetCachedModels(), std::move(mgr), manager,
-                         disposed_, remote_model_http_transport_);
+                         disposed_, remote_model_http_transport_, model_http_transport_);
   });
 }
 
@@ -204,7 +208,7 @@ Napi::Value Catalog::GetLoadedModels(const Napi::CallbackInfo& info) {
   Napi::ObjectReference mgr = CloneManager(manager_);
   return CallChecked<Napi::Value>(env, [&]() -> Napi::Value {
     return WrapModelList(env, catalog_->GetLoadedModels(), std::move(mgr), manager,
-                         disposed_, remote_model_http_transport_);
+                         disposed_, remote_model_http_transport_, model_http_transport_);
   });
 }
 
@@ -251,16 +255,18 @@ Napi::Value Catalog::GetModelVersions(const Napi::CallbackInfo& info) {
         return catalog->GetModelVersions(model_alias, variant_name, max_versions);
       },
       [manager_pin, manager_lifetime = std::weak_ptr<foundry_local::Manager>(manager), disposed = disposed_,
-       transport = remote_model_http_transport_](
+       transport = remote_model_http_transport_, manager_transport = model_http_transport_](
           Napi::Env env, foundry_local::ModelList& ml) -> Napi::Value {
-        return WrapModelList(env, std::move(ml), CloneManager(*manager_pin), manager_lifetime, disposed, transport);
+        return WrapModelList(env, std::move(ml), CloneManager(*manager_pin), manager_lifetime, disposed, transport,
+                             manager_transport);
       },
       CloneManager(manager_),
       [disposed = disposed_]() {
         if (disposed->load()) {
           throw foundry_local::Error("Manager has been disposed", FOUNDRY_LOCAL_ERROR_INVALID_USAGE);
         }
-      });
+      },
+      TransportExecutionPolicy(model_http_transport_));
 }
 
 // ── Single-model lookups ─────────────────────────────────────────────────────
@@ -281,7 +287,7 @@ Napi::Value Catalog::GetModel(const Napi::CallbackInfo& info) {
   return CallChecked<Napi::Value>(env, [&]() -> Napi::Value {
     auto owned = catalog_->GetModel(alias);
     return WrapOwnedModelOrUndefined(env, std::move(owned), std::move(mgr), manager, disposed_,
-                                     remote_model_http_transport_);
+                                     remote_model_http_transport_, model_http_transport_);
   });
 }
 
@@ -301,7 +307,7 @@ Napi::Value Catalog::GetModelVariant(const Napi::CallbackInfo& info) {
   return CallChecked<Napi::Value>(env, [&]() -> Napi::Value {
     auto owned = catalog_->GetModelVariant(model_id);
     return WrapOwnedModelOrUndefined(env, std::move(owned), std::move(mgr), manager, disposed_,
-                                     remote_model_http_transport_);
+                                     remote_model_http_transport_, model_http_transport_);
   });
 }
 
@@ -325,7 +331,7 @@ Napi::Value Catalog::GetLatestVersion(const Napi::CallbackInfo& info) {
   return CallChecked<Napi::Value>(env, [&]() -> Napi::Value {
     auto owned = catalog_->GetLatestVersion(*arg);
     return WrapOwnedModelOrUndefined(env, std::move(owned), std::move(mgr), manager, disposed_,
-                                     remote_model_http_transport_);
+                                     remote_model_http_transport_, model_http_transport_);
   });
 }
 
@@ -350,15 +356,17 @@ Napi::Value Catalog::GetListAsync(const Napi::CallbackInfo& info, int kind) {
         if (kind == 1) return catalog->GetCachedModels();
         return catalog->GetLoadedModels(); },
       [pin, weak = std::weak_ptr<foundry_local::Manager>(manager), disposed = disposed_,
-       transport = remote_model_http_transport_](Napi::Env env, foundry_local::ModelList& models) {
-        return WrapModelList(env, std::move(models), CloneManager(*pin), weak, disposed, transport);
+       transport = remote_model_http_transport_, manager_transport = model_http_transport_](
+          Napi::Env env, foundry_local::ModelList& models) {
+        return WrapModelList(env, std::move(models), CloneManager(*pin), weak, disposed, transport, manager_transport);
       },
       Napi::Persistent(info.This().As<Napi::Object>()),
       [disposed = disposed_]() {
         if (disposed->load()) {
           throw foundry_local::Error("Manager has been disposed", FOUNDRY_LOCAL_ERROR_INVALID_USAGE);
         }
-      });
+      },
+      TransportExecutionPolicy(model_http_transport_));
 }
 
 Napi::Value Catalog::GetSingleAsync(const Napi::CallbackInfo& info, int kind) {
@@ -397,15 +405,18 @@ Napi::Value Catalog::GetSingleAsync(const Napi::CallbackInfo& info, int kind) {
         if (kind == 1) return catalog->GetModelVariant(name);
         return catalog->GetLatestVersion(*argument); },
       [pin, weak = std::weak_ptr<foundry_local::Manager>(manager), disposed = disposed_,
-       transport = remote_model_http_transport_](Napi::Env env, std::unique_ptr<foundry_local::IModel>& model) {
-        return WrapOwnedModelOrUndefined(env, std::move(model), CloneManager(*pin), weak, disposed, transport);
+       transport = remote_model_http_transport_, manager_transport = model_http_transport_](
+          Napi::Env env, std::unique_ptr<foundry_local::IModel>& model) {
+        return WrapOwnedModelOrUndefined(env, std::move(model), CloneManager(*pin), weak, disposed, transport,
+                                         manager_transport);
       },
       Napi::Persistent(info.This().As<Napi::Object>()),
       [disposed = disposed_]() {
         if (disposed->load()) {
           throw foundry_local::Error("Manager has been disposed", FOUNDRY_LOCAL_ERROR_INVALID_USAGE);
         }
-      });
+      },
+      TransportExecutionPolicy(model_http_transport_));
 }
 
 namespace {
@@ -480,10 +491,10 @@ Napi::Value Catalog::RegisterModel(const Napi::CallbackInfo& info) {
         return catalog->RegisterModel(model_path, model_id, *metadata);
       },
       [manager_pin, manager_lifetime = std::weak_ptr<foundry_local::Manager>(manager), disposed,
-       transport = remote_model_http_transport_](
+       transport = remote_model_http_transport_, manager_transport = model_http_transport_](
           Napi::Env env, std::unique_ptr<foundry_local::IModel>& model) -> Napi::Value {
         return WrapOwnedModelOrUndefined(env, std::move(model), CloneManager(*manager_pin), manager_lifetime,
-                                         disposed, transport);
+                                         disposed, transport, manager_transport);
       },
       Napi::Reference<Napi::Object>::New(info.This().As<Napi::Object>(), 1),
       [disposed]() {
@@ -510,7 +521,7 @@ Napi::Value Catalog::RegisterModelSync(const Napi::CallbackInfo& info) {
   return CallChecked<Napi::Value>(env, [&]() -> Napi::Value {
     auto model = catalog_->RegisterModel(model_path, model_id, *metadata);
     return WrapOwnedModelOrUndefined(env, std::move(model), std::move(manager), manager_lifetime, disposed_,
-                                     remote_model_http_transport_);
+                                     remote_model_http_transport_, model_http_transport_);
   });
 }
 
