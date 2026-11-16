@@ -11,6 +11,8 @@ mod item_queue;
 mod model_http_transport;
 mod non_generative;
 mod request;
+#[cfg(feature = "model-http-reqwest")]
+mod reqwest_transport;
 mod response;
 mod session;
 mod types;
@@ -37,6 +39,8 @@ pub use self::non_generative::{
     RankingSession,
 };
 pub use self::request::{Request, RequestOptions, SearchOptions, ToolChoice};
+#[cfg(feature = "model-http-reqwest")]
+pub use self::reqwest_transport::ReqwestTransport;
 pub use self::response::{FinishReason, Response, Usage};
 pub use self::session::{
     AudioSession, ChatSession, CustomToolDefinition, EmbeddingsSession, ItemStream,
