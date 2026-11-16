@@ -368,6 +368,8 @@ unsafe extern "system" fn read(
         if state.eof {
             return Ok(());
         }
+        // Native output storage can be uninitialized, but a safe Rust slice must contain valid u8 values.
+        ptr::write_bytes(buffer, 0, size);
         let result = operation
             .inner
             .read(std::slice::from_raw_parts_mut(buffer, size));
