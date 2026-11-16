@@ -61,6 +61,7 @@ Foundry releases each successful operation exactly once, including operations th
 All callbacks use `FL_API_CALL`.
 No exception, Rust panic, or managed exception can cross the C boundary.
 Error statuses must come from the same native runtime's `Status_Create`.
+C++ adapters can call `foundry_local::CreateStatus(code, message)` without direct access to the C function table.
 Foundry takes ownership of each returned status.
 
 ### Streaming and cancellation
