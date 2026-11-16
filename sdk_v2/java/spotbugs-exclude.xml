@@ -5,6 +5,10 @@
     <Class name="~com\.microsoft\.foundry\.local\.NativeApi\$(AudioData|BytesData|CallbackData|ResultData|SegmentData)"/>
     <Bug pattern="URF_UNREAD_PUBLIC_OR_PROTECTED_FIELD,UUF_UNUSED_PUBLIC_OR_PROTECTED_FIELD,UWF_UNWRITTEN_PUBLIC_OR_PROTECTED_FIELD"/>
   </Match>
+  <Match>
+    <Class name="~com\.microsoft\.foundry\.local\.NativeModelHttpTransport\$(TransportData|RequestData)"/>
+    <Bug pattern="URF_UNREAD_PUBLIC_OR_PROTECTED_FIELD,UUF_UNUSED_PUBLIC_OR_PROTECTED_FIELD,UWF_UNWRITTEN_PUBLIC_OR_PROTECTED_FIELD"/>
+  </Match>
   <!-- AudioSession intentionally shares the manager's lifecycle monitor with Model and Catalog. -->
   <Match>
     <Class name="com.microsoft.foundry.local.AudioSession"/>

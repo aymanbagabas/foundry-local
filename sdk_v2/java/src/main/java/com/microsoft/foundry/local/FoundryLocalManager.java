@@ -22,16 +22,28 @@ public final class FoundryLocalManager implements AutoCloseable {
     final NativeApi api;
     final Set<OwnedSession> sessions = new HashSet<>();
     private final Map<CatalogType, Catalog> catalogs = new EnumMap<>(CatalogType.class);
+    private final boolean customModelTransport;
     private Pointer handle;
 
     public FoundryLocalManager(Configuration configuration) {
         NativeApi.outsideCallback();
+        customModelTransport = configuration.modelHttpTransport() != null;
         synchronized (FoundryLocalManager.class) {
             if (open != null) throw new IllegalStateException("Only one FoundryLocalManager may be open per JVM");
             installExitHook();
             api = NativeApi.load(configuration.runtimeDirectory());
+            if (configuration.modelHttpTransport() != null) NativeApi.requireTransportApi(api.apiVersion);
             Pointer config = api.create(api.config, NativeApi.ConfigurationApi.CREATE, configuration.appName());
             try {
+                for (String url : configuration.catalogUrls()) {
+                    api.check(api.config.pointer(NativeApi.ConfigurationApi.ADD_CATALOG_URL, config, url, null));
+                }
+                if (configuration.modelHttpTransport() != null) {
+                    try (var bridge = new NativeModelHttpTransport(api, configuration.modelHttpTransport())) {
+                        api.check(NativeApi.registerModelHttpTransport(
+                                api.apiVersion, api.config, config, bridge.table.getPointer()));
+                    }
+                }
                 api.check(api.config.pointer(
                         NativeApi.ConfigurationApi.SET_DEFAULT_LOG_LEVEL, config,
                         configuration.logLevel().nativeValue()));
@@ -96,6 +108,12 @@ public final class FoundryLocalManager implements AutoCloseable {
         Objects.requireNonNull(type, "type");
         synchronized (this) {
             checkOpen();
+            if (type == CatalogType.AZURE_REGISTRY && customModelTransport) {
+                throw new FoundryLocalException(1, "Azure Registry catalogs do not support custom model HTTP transport");
+            }
+            if (type == CatalogType.AZURE_REGISTRY && api.apiVersion < 4) {
+                throw new UnsupportedOperationException("Azure Registry catalogs require native C API 4");
+            }
             return catalogs.computeIfAbsent(type, value -> new Catalog(
                     this,
                     api.create(

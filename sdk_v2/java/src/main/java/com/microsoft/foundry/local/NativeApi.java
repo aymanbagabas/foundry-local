@@ -21,19 +21,22 @@ import java.util.Map;
 import java.util.function.IntFunction;
 
 /**
- * Narrow binding to the Foundry Local C API v2.
+ * Narrow binding to the Foundry Local C API (5 preferred, 2 minimum).
  * All supported targets use 64-bit pointers/size_t. C bool is one byte, not JNA boolean.
  */
 final class NativeApi {
     static final int VERSION = 2;
+    static final int API_VERSION = 5;
     static final ThreadLocal<Boolean> IN_CALLBACK = ThreadLocal.withInitial(() -> false);
     private static NativeApi resident;
     private final List<NativeLibrary> libraries = new ArrayList<>();
     final Path directory;
     final String version;
+    final int apiVersion;
     final Table root, config, catalog, model, item, inference;
 
     static final class Root {
+        static final int STATUS_CREATE = 0;
         static final int STATUS_RELEASE = 1;
         static final int MANAGER_CREATE = 4;
         static final int MANAGER_RELEASE = 5;
@@ -60,7 +63,9 @@ final class NativeApi {
         static final int SET_DEFAULT_LOG_LEVEL = 2;
         static final int SET_APP_DATA_DIRECTORY = 3;
         static final int SET_MODEL_CACHE_DIRECTORY = 5;
+        static final int ADD_CATALOG_URL = 6;
         static final int SET_ADDITIONAL_OPTIONS = 10;
+        static final int SET_MODEL_HTTP_TRANSPORT = 12;
     }
 
     static final class CatalogApi {
@@ -205,16 +210,17 @@ final class NativeApi {
         }
         NativeLibrary library = open(foundryLibrary);
         libraries.add(library);
-        Pointer api;
+        Negotiated negotiated;
         try {
             Function negotiate = library.getFunction("FoundryLocalGetApi");
-            api = requireApiVersion(requested ->
+            negotiated = negotiate(requested ->
                     negotiate.invokePointer(new Object[] {requested}));
         } catch (UnsatisfiedLinkError e) {
             throw new IllegalStateException("Native runtime does not expose C API " + VERSION, e);
         }
         version = text(library.getFunction("FoundryLocalGetVersionString").invokePointer(new Object[0]));
-        root = new Table(api);
+        apiVersion = negotiated.version();
+        root = new Table(negotiated.pointer());
         catalog = new Table(root.pointer(Root.GET_CATALOG_API));
         config = new Table(root.pointer(Root.GET_CONFIGURATION_API));
         item = new Table(root.pointer(Root.GET_ITEM_API));
@@ -223,9 +229,30 @@ final class NativeApi {
     }
 
     static Pointer requireApiVersion(IntFunction<Pointer> lookup) {
-        Pointer api = lookup.apply(VERSION);
-        if (api == null) throw new IllegalStateException("Native runtime does not expose C API " + VERSION);
-        return api;
+        return negotiate(lookup).pointer();
+    }
+
+    record Negotiated(int version, Pointer pointer) {}
+
+    static Negotiated negotiate(IntFunction<Pointer> lookup) {
+        for (int version = API_VERSION; version >= VERSION; version--) {
+            Pointer api = lookup.apply(version);
+            if (api != null) return new Negotiated(version, api);
+        }
+        throw new IllegalStateException("Native runtime does not expose C API " + VERSION + " or later");
+    }
+
+    static void requireTransportApi(int negotiatedVersion) {
+        if (negotiatedVersion < 5) {
+            throw new UnsupportedOperationException("Custom model HTTP transport requires native C API 5");
+        }
+    }
+
+    static Pointer registerModelHttpTransport(int negotiatedVersion, Table configurationApi,
+            Pointer configuration, Pointer transport) {
+        if (transport == null && negotiatedVersion < 5) return null;
+        requireTransportApi(negotiatedVersion);
+        return configurationApi.pointer(ConfigurationApi.SET_MODEL_HTTP_TRANSPORT, configuration, transport);
     }
 
     private static List<String> dependencyLibraryNames() {

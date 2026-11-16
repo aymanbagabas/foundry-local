@@ -59,8 +59,9 @@ code, Foundry Local native libraries, execution providers, or model weights.
 
 Prepare a directory containing the matching Foundry Local native runtime for
 the current OS and architecture. Pass that directory through `Configuration`.
-The Java binding requires C API v2. Runtimes exposing only v1 are rejected
-before their native function tables are accessed.
+The Java binding negotiates C API 5, 4, 3, then 2. Runtimes exposing only v1
+are rejected before their native function tables are accessed.
+Custom model HTTP transports require API 5.
 
 The runtime directory must contain:
 
@@ -93,6 +94,14 @@ telemetry. Applications can override either setting through the
 `disableNonessentialTelemetry(false)`. Runtime diagnostics such as
 `ORTGENAI_ORT_VERBOSE_LOGGING` can also control the underlying ONNX Runtime
 GenAI logging where supported.
+
+## Model HTTP transports
+
+For application-controlled model acquisition, see
+[Custom model HTTP transports](docs/model-http-transport.md).
+The neutral interface supports application clients.
+An optional Apache HttpClient 5 adapter provides local proxy, trust, and network settings.
+The [registered example](examples/ModelHttpTransportExample.java) queries a loopback catalog through the native runtime.
 
 ## Streaming ASR
 

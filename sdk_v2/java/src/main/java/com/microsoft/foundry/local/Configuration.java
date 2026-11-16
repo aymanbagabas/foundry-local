@@ -2,6 +2,8 @@
 package com.microsoft.foundry.local;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 
 /**
@@ -17,6 +19,8 @@ public final class Configuration {
     private final Path appDataDirectory;
     private final LogLevel logLevel;
     private final boolean disableNonessentialTelemetry;
+    private final ModelHttpTransport modelHttpTransport;
+    private final List<String> catalogUrls;
 
     private Configuration(Builder builder) {
         appName = builder.appName;
@@ -25,6 +29,8 @@ public final class Configuration {
         appDataDirectory = builder.appDataDirectory;
         logLevel = builder.logLevel;
         disableNonessentialTelemetry = builder.disableNonessentialTelemetry;
+        modelHttpTransport = builder.modelHttpTransport;
+        catalogUrls = List.copyOf(builder.catalogUrls);
     }
 
     public static Builder builder(String appName) {
@@ -37,6 +43,8 @@ public final class Configuration {
     public Path appDataDirectory() { return appDataDirectory; }
     public LogLevel logLevel() { return logLevel; }
     public boolean disableNonessentialTelemetry() { return disableNonessentialTelemetry; }
+    public ModelHttpTransport modelHttpTransport() { return modelHttpTransport; }
+    public List<String> catalogUrls() { return catalogUrls; }
 
     public static final class Builder {
         private final String appName;
@@ -45,6 +53,8 @@ public final class Configuration {
         private Path appDataDirectory;
         private LogLevel logLevel = LogLevel.FATAL;
         private boolean disableNonessentialTelemetry = true;
+        private ModelHttpTransport modelHttpTransport;
+        private final List<String> catalogUrls = new ArrayList<>();
 
         private Builder(String appName) {
             this.appName = validateAppName(appName);
@@ -72,6 +82,24 @@ public final class Configuration {
 
         public Builder disableNonessentialTelemetry(boolean value) {
             disableNonessentialTelemetry = value;
+            return this;
+        }
+
+        /** Set a client-local transport. Null preserves the native default. Requires native API 5 when set. */
+        public Builder modelHttpTransport(ModelHttpTransport value) {
+            modelHttpTransport = value;
+            return this;
+        }
+
+        /** Add a public catalog endpoint. An empty list preserves the native default. */
+        public Builder addCatalogUrl(String value) {
+            Objects.requireNonNull(value, "catalogUrl");
+            var uri = java.net.URI.create(value);
+            if (!("http".equalsIgnoreCase(uri.getScheme()) || "https".equalsIgnoreCase(uri.getScheme()))
+                    || uri.getHost() == null || uri.getRawUserInfo() != null || uri.getRawFragment() != null) {
+                throw new IllegalArgumentException("An absolute HTTP(S) catalog URL is required");
+            }
+            catalogUrls.add(value);
             return this;
         }
 
