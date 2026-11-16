@@ -15,7 +15,6 @@
 namespace {
 
 struct TransportState {
-  const flApi* api;
   std::atomic<size_t> references{1};
   std::atomic<size_t> requests{0};
   std::atomic<size_t> operations{0};
@@ -49,7 +48,7 @@ flStatus* FL_API_CALL CreateOperation(void* user_data, const flHttpRequestData* 
   const bool cancellation_example =
       std::strcmp(request->method, "GET") == 0 && std::strcmp(request->url, "https://example.invalid/model") == 0;
   if (!catalog_request && !cancellation_example) {
-    return state->api->Status_Create(FOUNDRY_LOCAL_ERROR_INVALID_ARGUMENT, "unsupported example request");
+    return foundry_local::CreateStatus(FOUNDRY_LOCAL_ERROR_INVALID_ARGUMENT, "unsupported example request");
   }
 
   try {
@@ -59,14 +58,14 @@ flStatus* FL_API_CALL CreateOperation(void* user_data, const flHttpRequestData* 
     *out_operation = operation.release();
     return nullptr;
   } catch (const std::exception&) {
-    return state->api->Status_Create(FOUNDRY_LOCAL_ERROR_INTERNAL, "could not allocate example operation");
+    return foundry_local::CreateStatus(FOUNDRY_LOCAL_ERROR_INTERNAL, "could not allocate example operation");
   }
 }
 
 flStatus* FL_API_CALL Send(void* handle, flHttpResponseData* response) noexcept {
   auto& operation = *static_cast<Operation*>(handle);
   if (operation.canceled.load()) {
-    return operation.state->api->Status_Create(FOUNDRY_LOCAL_ERROR_OPERATION_CANCELLED, "example operation canceled");
+    return foundry_local::CreateStatus(FOUNDRY_LOCAL_ERROR_OPERATION_CANCELLED, "example operation canceled");
   }
 
   operation.state->requests.fetch_add(1);
@@ -81,7 +80,7 @@ flStatus* FL_API_CALL Read(void* handle, uint8_t* buffer, size_t capacity, size_
   auto& operation = *static_cast<Operation*>(handle);
   *bytes_read = 0;
   if (operation.canceled.load()) {
-    return operation.state->api->Status_Create(FOUNDRY_LOCAL_ERROR_OPERATION_CANCELLED, "example operation canceled");
+    return foundry_local::CreateStatus(FOUNDRY_LOCAL_ERROR_OPERATION_CANCELLED, "example operation canceled");
   }
 
   // Deliberate short reads show that the SDK must consume a stream rather than assume one complete buffer.
@@ -147,7 +146,7 @@ int main(int argc, char** argv) {
       throw std::runtime_error("the runtime does not support the custom transport API");
     }
 
-    std::unique_ptr<TransportState, ReleaseState> state(new TransportState{api});
+    std::unique_ptr<TransportState, ReleaseState> state(new TransportState{});
     flHttpTransport transport{};
     transport.version = FOUNDRY_LOCAL_HTTP_TRANSPORT_VERSION;
     transport.user_data = state.get();
