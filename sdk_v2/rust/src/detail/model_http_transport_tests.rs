@@ -9,6 +9,7 @@ enum Mode {
     BadStatus,
     BadHeader,
     BadRead,
+    InspectReadBuffer,
     PanicCreate,
     PanicSend,
     PanicRead,
@@ -122,6 +123,9 @@ impl ModelHttpOperation for Exchange {
             Mode::PanicRead => panic!("secret read diagnostic"),
             Mode::BadRead => return Ok(buffer.len() + 1),
             Mode::BlockRead => self.wait_for_cancel(),
+            Mode::InspectReadBuffer => {
+                assert!(buffer.iter().all(|byte| *byte == 0));
+            }
             _ => {}
         }
         let mut position = self.0.position.lock().unwrap();
@@ -242,6 +246,19 @@ impl Drop for Bridge {
     fn drop(&mut self) {
         unsafe { (self.table.ReleaseOperation)(self.operation) };
     }
+}
+
+#[test]
+fn initializes_native_output_storage_before_exposing_it_to_safe_rust() {
+    let bridge = Bridge::start(Mode::InspectReadBuffer);
+    bridge.send().unwrap();
+    let mut buffer = [0xa5; 8];
+    for expected in b"abc" {
+        assert_eq!(bridge.read(&mut buffer).unwrap(), 1);
+        assert_eq!(buffer[0], *expected);
+        buffer.fill(0xa5);
+    }
+    assert_eq!(bridge.read(&mut buffer).unwrap(), 0);
 }
 
 #[test]
