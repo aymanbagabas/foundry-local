@@ -253,6 +253,9 @@ class TestFindLibraryWheelBundled:
 
         monkeypatch.delenv("FOUNDRY_LOCAL_LIB_DIR", raising=False)
         monkeypatch.setattr(_ll, "__file__", str(native_pkg_dir / "lib_loader.py"))
+        # A caller may place pytest's basetemp inside the checkout's ignored
+        # build directory. Keep this "no dev build" scenario independent of it.
+        monkeypatch.setattr(_ll, "_dev_build_candidates", lambda *_args: [])
 
         with patch.object(_ll.sys, "platform", "linux"), \
              patch.object(_ll.platform, "machine", return_value="aarch64"):

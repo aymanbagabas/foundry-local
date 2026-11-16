@@ -5,10 +5,12 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 from urllib.parse import urlparse
 
 from foundry_local_sdk.exception import FoundryLocalException
 from foundry_local_sdk.logging_helper import LogLevel
+from foundry_local_sdk.model_http_transport import ModelHttpTransport
 from foundry_local_sdk.version import __version__
 
 # Maps Python LogLevel → native flLogLevel integer values (from foundry_local_c.h)
@@ -58,6 +60,10 @@ class Configuration:
         use_shared_host: Route execution through the packaged native shared host. Defaults to False.
             Discovery does not start it; execution starts or joins a compatible host. Closing this
             manager releases only this client. Cannot be combined with ``web.external_url``.
+        model_http_transport: Application-owned synchronous HTTP transport for model acquisition.
+            Requires native API v5. Callbacks remain client-local in shared-host mode.
+            Covers the public catalog and registry/blob requests, not Azure Registry catalogs,
+            telemetry, inference, or execution-provider downloads. None uses the default transport.
         external_service_url: URL of an external Foundry Local service. When
             set, the catalog operates in cache-only mode — it reads only the
             local disk cache populated by that external service and skips
@@ -99,6 +105,7 @@ class Configuration:
         catalog_region: str | None = None,
         disable_nonessential_telemetry: bool = False,
         use_shared_host: bool = False,
+        model_http_transport: ModelHttpTransport | None = None,
     ) -> None:
         self.app_name = app_name
         # v1-compat no-op: native loading happens at import time in
@@ -114,6 +121,7 @@ class Configuration:
         self.catalog_region = catalog_region
         self.disable_nonessential_telemetry = disable_nonessential_telemetry
         self.use_shared_host = use_shared_host
+        self.model_http_transport = model_http_transport
 
     def validate(self) -> None:
         """Validate the configuration.
@@ -173,9 +181,8 @@ class Configuration:
         if self.use_shared_host:
             config_values["UseSharedHost"] = "true"
 
-        if self.web is not None:
-            if self.web.urls is not None:
-                config_values["WebServiceUrls"] = self.web.urls
+        if self.web is not None and self.web.urls is not None:
+            config_values["WebServiceUrls"] = self.web.urls
 
         if self.additional_settings is not None:
             for key, value in self.additional_settings.items():
@@ -206,7 +213,16 @@ class Configuration:
             api.config.Configuration_Release(native_config)
             raise
 
-    def _apply_settings(self, native_config, api, ffi) -> object:
+    def _apply_settings(self, native_config: Any, api: Any, ffi: Any) -> object:
+        if self.model_http_transport is not None:
+            # Never even read an appended slot on an older function table.
+            if api.api_version < 5:
+                raise FoundryLocalException("Model HTTP transport requires an API v5 Foundry Local runtime.")
+            from foundry_local_sdk._native.http_transport import _TransportBridge
+
+            bridge = _TransportBridge(self.model_http_transport, api._get())
+            api.check_status(api.config.SetModelHttpTransport(native_config, bridge.table))
+
         if self.use_shared_host:
             if api.api_version < 3:
                 raise FoundryLocalException(

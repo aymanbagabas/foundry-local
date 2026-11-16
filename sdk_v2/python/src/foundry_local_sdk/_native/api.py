@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import importlib
 import os
+from typing import Any
 
 from foundry_local_sdk._native.lib_loader import find_library, prepare_native_dependencies
 from foundry_local_sdk.exception import FoundryLocalException
 
 # Function tables negotiate separately from versioned payload layouts, which remain at v2.
-_FOUNDRY_LOCAL_API_VERSION: int = 4
+_FOUNDRY_LOCAL_API_VERSION: int = 5
 _MINIMUM_API_VERSION: int = 2
 
 _lib_path = find_library()
@@ -32,7 +33,7 @@ _lib_path = find_library()
 # The returned handles MUST be kept alive at module scope. We assign to a
 # module-level name so the GC never collects them (which would unload the DLLs
 # mid-process and crash any in-flight ORT call).
-_preloaded_native_deps: list = []
+_preloaded_native_deps: list[Any] = []
 if _lib_path is not None:
     _preloaded_native_deps = prepare_native_dependencies(_lib_path.parent)
 
@@ -114,7 +115,8 @@ class _Api:
         ptr = _lib.FoundryLocalGetVersionString()
         if ptr == ffi.NULL:
             return ""
-        return ffi.string(ptr).decode("utf-8")
+        raw: bytes = ffi.string(ptr)
+        return raw.decode("utf-8")
 
 
 class _LazyApi:
@@ -141,7 +143,7 @@ class _LazyApi:
             self._instance = inst
         return inst
 
-    def __getattr__(self, name: str) -> object:
+    def __getattr__(self, name: str) -> Any:
         return getattr(self._get(), name)
 
 

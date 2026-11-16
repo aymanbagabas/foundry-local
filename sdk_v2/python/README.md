@@ -17,6 +17,14 @@ and output, see [Inference with the Foundry Local SDK](../INFERENCING.md).
 - **Built-in Web Service** – optional HTTP endpoint for multi-process scenarios
 - **Native Performance** – cffi (API mode) binding to the Foundry Local native library
 
+## Custom model HTTP transport
+
+Use `Configuration(model_http_transport=transport)` to provide application-owned,
+streaming HTTP for model acquisition with native API 5. See the
+[transport protocols, ownership and cancellation requirements](docs/model-http-transport.md)
+and the [registered native catalog example](examples/custom_model_http_transport.py).
+Older API 2–4 runtimes remain supported when no transport is configured.
+
 ## Installation
 
 ```bash

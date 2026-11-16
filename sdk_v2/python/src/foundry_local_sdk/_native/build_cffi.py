@@ -10,16 +10,17 @@ The generated ``_cffi_bindings.abi3.pyd`` (Windows) or
 file in the ``_native/`` package directory.
 
 The extension is compiled against the real ``foundry_local_c.h`` header so
-struct layouts and enum values are verified at build time.  The actual
-``foundry_local.dll/.so/.dylib`` is *not* linked at compile time — it is
-discovered and loaded at runtime by ``lib_loader.py`` via ``ffi.dlopen()``.
+struct layouts and enum values are verified at build time. It links against
+``foundry_local``; the binding discovers and preloads ORT, GenAI and Foundry
+before importing the extension.
 """
 
 from __future__ import annotations
-import os as _os
-import sys as _sys
 
+import os as _os
 import pathlib
+import shutil
+import sys as _sys
 
 import cffi
 
@@ -489,6 +490,41 @@ typedef struct flInferenceApi {
  * Configuration API vtable
  * ----------------------------------------------------------------------- */
 
+typedef struct flHttpHeader {
+    const char* name;
+    const char* value;
+} flHttpHeader;
+
+typedef struct flHttpRequestData {
+    uint32_t version;
+    const char* method;
+    const char* url;
+    const flHttpHeader* headers;
+    size_t header_count;
+    const uint8_t* body;
+    size_t body_size;
+    uint64_t timeout_ms;
+} flHttpRequestData;
+
+typedef struct flHttpResponseData {
+    uint32_t version;
+    uint32_t status_code;
+    const flHttpHeader* headers;
+    size_t header_count;
+} flHttpResponseData;
+
+typedef struct flHttpTransport {
+    uint32_t version;
+    void* user_data;
+    void (*Retain)(void*);
+    void (*Release)(void*);
+    flStatusPtr (*CreateOperation)(void*, const flHttpRequestData*, void**);
+    flStatusPtr (*Send)(void*, flHttpResponseData*);
+    flStatusPtr (*Read)(void*, uint8_t*, size_t, size_t*);
+    void (*Cancel)(void*);
+    void (*ReleaseOperation)(void*);
+} flHttpTransport;
+
 typedef struct flConfigurationApi {
     flStatusPtr (*Create)(const char* app_name, flConfiguration** out_config);
     void (*Configuration_Release)(flConfiguration* instance);
@@ -502,6 +538,7 @@ typedef struct flConfigurationApi {
     flStatusPtr (*SetExternalServiceUrl)(flConfiguration* config, const char* url);
     flStatusPtr (*SetAdditionalOptions)(flConfiguration* config, const flKeyValuePairs* options);
     flStatusPtr (*SetUseSharedHost)(flConfiguration* config, _Bool enabled);
+    flStatusPtr (*SetModelHttpTransport)(flConfiguration* config, const flHttpTransport* transport);
 } flConfigurationApi;
 
 /* -----------------------------------------------------------------------
@@ -613,6 +650,8 @@ else:
     _lib_candidates = [
         _HERE.parent / "linux-x64" / "libfoundry_local.so",
         _HERE.parent / "linux-arm64" / "libfoundry_local.so",
+        _SDK_V2_DIR / "cpp" / "build" / "Linux" / "RelWithDebInfo" / "bin" / "libfoundry_local.so",
+        _SDK_V2_DIR / "cpp" / "build" / "Linux" / "Debug" / "bin" / "libfoundry_local.so",
         _SDK_V2_DIR / "cpp" / "build" / "Linux" / "RelWithDebInfo" / "libfoundry_local.so",
         _SDK_V2_DIR / "cpp" / "build" / "Linux" / "Debug" / "libfoundry_local.so",
     ]
@@ -681,10 +720,11 @@ ffi.set_source(
 )
 
 if __name__ == "__main__":
-    # cffi derives the output subdirectory from the dotted module name
-    # ("foundry_local_sdk/_native/_cffi_bindings"), so tmpdir must point to the
-    # package source root (src/) for the .pyd to land at:
-    #   src/foundry_local_sdk/_native/_cffi_bindings.abi3.pyd  (Windows)
-    #   src/foundry_local_sdk/_native/_cffi_bindings.abi3.so   (Linux/macOS)
-    _src_dir = str(_HERE.parent.parent.parent)  # sdk_v2/python/src/
-    ffi.compile(tmpdir=_src_dir, verbose=True)
+    # Keep generated C/object files out of the source tree. Let cffi choose the
+    # stable-ABI extension filename, then stage just that artifact for imports.
+    _build_dir = _SDK_V2_DIR / "python" / "build" / "cffi"
+    _extension = ffi.compile(
+        tmpdir=str(_build_dir),
+        verbose=True,
+    )
+    shutil.copy2(_extension, _HERE.parent / pathlib.Path(_extension).name)
