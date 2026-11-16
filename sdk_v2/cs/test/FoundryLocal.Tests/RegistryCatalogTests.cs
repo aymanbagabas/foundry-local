@@ -23,6 +23,7 @@ using PublicConfiguration = Microsoft.AI.Foundry.Local.Configuration;
 internal sealed class RegistryCatalogTests
 {
     [Test]
+    [Arguments(5u)]
     [Arguments(4u)]
     [Arguments(3u)]
     [Arguments(2u)]
@@ -37,8 +38,9 @@ internal sealed class RegistryCatalogTests
         }, out var selected);
 
         await Assert.That(attempted).IsEquivalentTo(
-            supportedVersion == 4 ? new uint[] { 4 } :
-            supportedVersion == 3 ? new uint[] { 4, 3 } : new uint[] { 4, 3, 2 });
+            supportedVersion == 5 ? new uint[] { 5 } :
+            supportedVersion == 4 ? new uint[] { 5, 4 } :
+            supportedVersion == 3 ? new uint[] { 5, 4, 3 } : new uint[] { 5, 4, 3, 2 });
         await Assert.That(attempted.SequenceEqual(attempted.OrderByDescending(v => v))).IsTrue();
         await Assert.That(ptr).IsEqualTo(supportedVersion == 0 ? IntPtr.Zero : new IntPtr(42));
         if (supportedVersion != 0)

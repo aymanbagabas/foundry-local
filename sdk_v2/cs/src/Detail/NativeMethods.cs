@@ -35,7 +35,7 @@ public static partial class NativeMethods
 {
     // Baseline table and payload layouts. New table-only features negotiate separately.
     public const uint ApiVersion = 2;
-    public const uint LatestApiVersion = 4;
+    public const uint LatestApiVersion = 5;
     public const string LibraryName = "foundry_local";
 
     // The first P/Invoke through this class can come from any of several entry

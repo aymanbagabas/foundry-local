@@ -89,6 +89,18 @@ public WebService Web { get; set; }
 
 [WebService](./microsoft.ai.foundry.local.configuration.webservice.md)<br>
 
+### **ModelHttpTransport**
+
+Optional client-local transport for public catalog, registry and blob acquisition.
+Requires native API 5; Azure Registry catalogs are not supported with this option.
+The caller owns the transport and disposes it only after its managers.
+
+```csharp
+public IModelHttpTransport? ModelHttpTransport { get; init; }
+```
+
+See [model HTTP transport contracts, HttpClient adapter and example](../model-http-transport.md).
+
 ### **UseSharedHost**
 
 Route existing model/session APIs through the packaged native shared host. Defaults to `false` (in-process).

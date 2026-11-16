@@ -354,6 +354,7 @@ public class FoundryLocalManager : IDisposable
             }
 
             _nativeConfig.SetUseSharedHost(_config.UseSharedHost);
+            _nativeConfig.SetHttpTransport(_config.ModelHttpTransport);
 
             // Create the native manager
             _nativeManager = new NativeManager(_nativeConfig);

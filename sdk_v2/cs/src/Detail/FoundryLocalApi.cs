@@ -31,6 +31,7 @@ internal static class Api
     internal static FlInferenceApi Inference;
     internal static FlConfigurationApi Config;
     internal static FlConfig_SetUseSharedHostDelegate? SetUseSharedHost;
+    internal static ModelHttpTransportBridge.SetTransportDelegate? SetModelHttpTransport;
     internal static FlApi_ManagerGetCatalogWithOptionsDelegate? GetCatalogWithOptions;
     internal static FlCatalogApi Catalog;
     internal static FlModelApi Model;
@@ -79,6 +80,7 @@ internal static class Api
             {
                 Config = Marshal.PtrToStructure<FlConfigurationApi>(p);
                 SetUseSharedHost = ReadSharedHostSetting(p, version);
+                SetModelHttpTransport = ReadModelHttpTransportSetting(p, version);
             }
 
             p = Root.GetCatalogApi();
@@ -149,6 +151,24 @@ internal static class Api
             + $"reports product version '{loadedRuntimeVersion}', but this SDK requires C API table version "
             + $"{NativeMethods.ApiVersion}. Update the native runtime ({NativeMethods.LibraryName} and the libraries "
             + "shipped with it).";
+    }
+
+    internal static ModelHttpTransportBridge.SetTransportDelegate? ReadModelHttpTransportSetting(
+        IntPtr configApi, uint version)
+    {
+        if (version < 5)
+        {
+            return null;
+        }
+
+        // API2 prefix has 11 slots, API3 appended shared hosting at slot11. API5 appends slot12.
+        var setter = Marshal.ReadIntPtr(configApi, 12 * IntPtr.Size);
+        if (setter == IntPtr.Zero)
+        {
+            throw new InvalidOperationException("The native runtime returned an incomplete v5 configuration API.");
+        }
+
+        return Marshal.GetDelegateForFunctionPointer<ModelHttpTransportBridge.SetTransportDelegate>(setter);
     }
 
     internal static void CheckStatus(IntPtr status)
@@ -290,6 +310,32 @@ public sealed class Configuration : IDisposable
     {
         Api.CheckStatus(Api.Config.SetCatalogRegion(Ptr, region));
         return this;
+    }
+
+    internal void SetHttpTransport(IModelHttpTransport? transport)
+    {
+        Throw.IfDisposed(_disposed, this);
+
+        var setter = Api.SetModelHttpTransport;
+        if (setter is null)
+        {
+            if (transport is not null)
+            {
+                throw new FoundryLocalException("Model HTTP transport requires an API v5 Foundry Local runtime.",
+                    FoundryLocalErrorCode.NotImplemented);
+            }
+
+            return;
+        }
+
+        if (transport is null)
+        {
+            Api.CheckStatus(setter(Ptr, IntPtr.Zero));
+            return;
+        }
+
+        using var registration = new ModelHttpTransportBridge(transport);
+        registration.Register(Ptr, setter);
     }
 
     public void Dispose()
