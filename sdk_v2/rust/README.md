@@ -30,6 +30,7 @@ see [Inference with the Foundry Local SDK](../INFERENCING.md).
 - **Exact request preflight** — Capture a chat request and session state, then asynchronously query its native token budget before generation
 - **Async-first** — Every operation is `async`; designed for use with the `tokio` runtime
 - **Safe FFI** — Dynamically loads the native Foundry Local engine (`foundry_local`) with a safe Rust wrapper
+- **Custom model HTTP** — Supply application-owned HTTP for native catalogs and model downloads
 
 ## Prerequisites
 
@@ -162,10 +163,42 @@ See the minimal [registry example](examples/azure_registry_catalog.rs):
 It downloads and loads `qwen2.5-0.5b` from `azureml-dev`, sends one chat prompt, and unloads it.
 Review the model license before running; adjust the registry/model names as needed.
 
-Registry catalogs/options require native API v4. The SDK negotiates v4, v3, then
+Registry catalogs/options require native API v4. The SDK negotiates v5, v4, v3, then
 v2; existing `catalog()`, `get_catalog(Public/Local)` and empty-options public/local
 calls continue to work on older runtimes. Catalog identity, caching and refresh
 are managed by the native core; the binding does not cache credentials or results.
+
+## Custom model HTTP
+
+Use `.model_http_transport(Arc<dyn ModelHttpTransport>)` to supply model HTTP through safe Rust traits.
+The application implements `ModelHttpTransport::create_operation` and `ModelHttpOperation::{send, read, cancel}`.
+Requests own their method, URL, ordered headers, body, and optional timeout.
+Header values support non-UTF-8 bytes and duplicate names.
+
+The transport performs one request without retries, redirects, or decompression.
+It enforces the total timeout from `send` through all reads.
+Its nonblocking `cancel` method must interrupt pending I/O and work concurrently with `send` or `read`.
+Trait methods and destructors must not panic.
+Fallible callback panics become errors; cancellation or destructor panics abort the process.
+
+Native API v5 is required only when this setting is present.
+The default transport and the native coordinator do not change.
+OpenAI clients do not use this transport.
+The current native runtime rejects custom transport for Azure Registry catalogs.
+See the [API contract](docs/api.md#custom-model-http).
+
+Run the [in-memory catalog example](examples/custom_model_http_transport.rs) against a local native build:
+
+```sh
+cd sdk_v2/rust
+export FOUNDRY_LOCAL_LIB_DIR="$(cd ../cpp/build/Linux/RelWithDebInfo/bin && pwd)"
+DOCS_RS=1 cargo run --example custom_model_http_transport
+```
+
+The example registers its transport through the real native configuration, manager, and catalog.
+It returns `{"value":[]}` with short reads, without network access or model weights.
+Its output reports the requests, reads, empty model list, and balanced ownership.
+Generated data stays under `target/`.
 
 ## Native shared serving
 
@@ -794,7 +827,7 @@ engine's dependencies regardless of rpath/search-path setup. On platforms where 
 ### Runtime Loading
 
 At runtime, the SDK uses `libloading` to dynamically load the `foundry_local` library, resolve the
-API version 2 function table via `FoundryLocalGetApi`, and cache the sub-API tables. No static
+latest supported function table (v5 through v2) via `FoundryLocalGetApi`, and cache the sub-API tables. No static
 linking or system-wide installation is required.
 
 ## Platform Support

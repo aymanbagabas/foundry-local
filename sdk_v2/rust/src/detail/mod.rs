@@ -8,6 +8,7 @@ pub(crate) mod info;
 pub(crate) mod items;
 pub(crate) mod manager;
 pub(crate) mod model;
+pub(crate) mod model_http_transport;
 pub(crate) mod native;
 pub(crate) mod session;
 pub(crate) mod task;

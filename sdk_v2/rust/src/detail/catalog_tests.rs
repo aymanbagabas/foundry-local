@@ -113,13 +113,46 @@ macro_rules! unused {
     }};
 }
 
-struct Fixture {
+pub(crate) struct Fixture {
     manager: NativeManager,
     // Keep the mock table alive until after the manager and its Api are dropped.
     _table: Box<flApiV4Vtable>,
 }
 
 impl Fixture {
+    pub(crate) fn for_transport() -> Self {
+        struct Status {
+            code: flErrorCode,
+            message: CString,
+        }
+        unsafe extern "system" fn create(code: flErrorCode, message: *const c_char) -> flStatusPtr {
+            Box::into_raw(Box::new(Status {
+                code,
+                message: CStr::from_ptr(message).to_owned(),
+            }))
+            .cast()
+        }
+        unsafe extern "system" fn release(status: *mut flStatus) {
+            drop(Box::from_raw(status.cast::<Status>()));
+        }
+        unsafe extern "system" fn code(status: *const flStatus) -> flErrorCode {
+            (*status.cast::<Status>()).code
+        }
+        unsafe extern "system" fn message(status: *const flStatus) -> *const c_char {
+            (*status.cast::<Status>()).message.as_ptr()
+        }
+        let mut fixture = Self::new(4);
+        fixture._table.v3.Status_Create = create;
+        fixture._table.v3.Status_Release = release;
+        fixture._table.v3.Status_GetErrorCode = code;
+        fixture._table.v3.Status_GetErrorMessage = message;
+        fixture
+    }
+
+    pub(crate) fn api(&self) -> Arc<Api> {
+        self.manager.api()
+    }
+
     fn new(version: u32) -> Self {
         CALLS.with(|calls| *calls.borrow_mut() = Calls::default());
         let table = Box::new(flApiV4Vtable {
@@ -168,6 +201,7 @@ impl Fixture {
             catalog: std::ptr::null(),
             config: std::ptr::null(),
             shared_host_setting: None,
+            model_http_transport_setting: None,
             catalog_with_options: unsafe { read_catalog_with_options(&table.v3, version) },
             item: std::ptr::null(),
             inference: std::ptr::null(),
@@ -334,10 +368,18 @@ fn legacy_tables_never_read_the_v4_slot() {
 }
 
 #[test]
-fn negotiation_prefers_v4_then_v3_then_v2() {
-    unsafe extern "system" fn v4(version: u32) -> *const flApiVtable {
+fn negotiation_prefers_v5_then_v4_then_v3_then_v2() {
+    unsafe extern "system" fn v5(version: u32) -> *const flApiVtable {
         CALLS.with(|calls| calls.borrow_mut().versions.push(version));
         std::ptr::NonNull::<flApiVtable>::dangling().as_ptr()
+    }
+    unsafe extern "system" fn v4(version: u32) -> *const flApiVtable {
+        CALLS.with(|calls| calls.borrow_mut().versions.push(version));
+        if version <= 4 {
+            std::ptr::NonNull::<flApiVtable>::dangling().as_ptr()
+        } else {
+            std::ptr::null()
+        }
     }
     unsafe extern "system" fn v3(version: u32) -> *const flApiVtable {
         CALLS.with(|calls| calls.borrow_mut().versions.push(version));
@@ -355,13 +397,13 @@ fn negotiation_prefers_v4_then_v3_then_v2() {
             std::ptr::null()
         }
     }
-    for (get_api, expected) in [(v4 as FoundryLocalGetApiFn, 4), (v3, 3), (v2, 2)] {
+    for (get_api, expected) in [(v5 as FoundryLocalGetApiFn, 5), (v4, 4), (v3, 3), (v2, 2)] {
         CALLS.with(|calls| *calls.borrow_mut() = Calls::default());
         assert_eq!(unsafe { negotiate_api(get_api) }.unwrap().1, expected);
         CALLS.with(|calls| {
             assert_eq!(
                 calls.borrow().versions,
-                (expected..=4).rev().collect::<Vec<_>>()
+                (expected..=5).rev().collect::<Vec<_>>()
             )
         });
     }

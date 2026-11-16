@@ -77,6 +77,17 @@ fn map_error(code: flErrorCode, message: String) -> FoundryLocalError {
     FoundryLocalError::Native { code, message }
 }
 
+fn require_model_http_transport_setting(
+    setter: Option<FlSetModelHttpTransportFn>,
+) -> Result<FlSetModelHttpTransportFn> {
+    setter.ok_or_else(|| {
+        map_error(
+            FOUNDRY_LOCAL_ERROR_NOT_IMPLEMENTED,
+            "custom model HTTP transport requires native API version 5 or newer".into(),
+        )
+    })
+}
+
 // ── Api ──────────────────────────────────────────────────────────────────────
 
 unsafe fn negotiate_api(get_api: FoundryLocalGetApiFn) -> Result<(*const flApiVtable, u32)> {
@@ -87,7 +98,7 @@ unsafe fn negotiate_api(get_api: FoundryLocalGetApiFn) -> Result<(*const flApiVt
         }
     }
     Err(FoundryLocalError::LibraryLoad {
-        reason: "native runtime does not support API version 4, 3 or 2".into(),
+        reason: "native runtime does not support API version 5, 4, 3 or 2".into(),
     })
 }
 
@@ -109,8 +120,20 @@ unsafe fn read_shared_host_setting(
     if version < 3 {
         return None;
     }
+
     // Read only the negotiated extension, never a larger reference over the version-2 prefix.
     std::ptr::addr_of!((*config.cast::<flConfigurationApiV3Vtable>()).SetUseSharedHost).read()
+}
+
+unsafe fn read_model_http_transport_setting(
+    config: *const flConfigurationApiVtable,
+    version: u32,
+) -> Option<FlSetModelHttpTransportFn> {
+    if version < 5 {
+        return None;
+    }
+    // Read only slot 12, after negotiation confirms the version-5 extent.
+    std::ptr::addr_of!((*config.cast::<flConfigurationApiV5Vtable>()).SetModelHttpTransport).read()
 }
 
 /// Loaded native library plus its resolved function tables.
@@ -124,6 +147,7 @@ pub(crate) struct Api {
     catalog: *const flCatalogApiVtable,
     config: *const flConfigurationApiVtable,
     shared_host_setting: Option<FlSetUseSharedHostFn>,
+    model_http_transport_setting: Option<FlSetModelHttpTransportFn>,
     catalog_with_options: Option<FlGetCatalogWithOptionsFn>,
     item: *const flItemApiVtable,
     inference: *const flInferenceApiVtable,
@@ -209,6 +233,9 @@ impl Api {
             config,
             // SAFETY: config is non-null and version identifies the available table extent.
             shared_host_setting: unsafe { read_shared_host_setting(config, version) },
+            model_http_transport_setting: unsafe {
+                read_model_http_transport_setting(config, version)
+            },
             // SAFETY: root is non-null and negotiation determines its available extent.
             catalog_with_options: unsafe { read_catalog_with_options(root, version) },
             item,
@@ -288,6 +315,10 @@ impl Api {
         })?;
         // SAFETY: the caller owns config and the version-negotiated setter copies the boolean.
         self.check(unsafe { setter(config, enabled) })
+    }
+
+    pub(crate) fn model_http_transport_setter(&self) -> Result<FlSetModelHttpTransportFn> {
+        require_model_http_transport_setting(self.model_http_transport_setting)
     }
 
     #[inline]
@@ -533,7 +564,7 @@ fn resolve_library_path(library_path: Option<&str>) -> Result<(PathBuf, Option<P
 
 #[cfg(test)]
 #[path = "catalog_tests.rs"]
-mod catalog_tests;
+pub(super) mod catalog_tests;
 
 #[cfg(test)]
 mod tests {
@@ -568,6 +599,39 @@ mod tests {
     fn legacy_configuration_never_reads_the_extension() {
         // SAFETY: version 2 must return before accessing even the first byte of this pointer.
         assert!(unsafe { read_shared_host_setting(std::ptr::null(), 2) }.is_none());
+    }
+
+    #[test]
+    fn model_transport_requires_version_five_without_reading_legacy_memory() {
+        for version in 2..=4 {
+            // SAFETY: legacy versions must return without accessing this pointer.
+            let setter = unsafe { read_model_http_transport_setting(std::ptr::null(), version) };
+            let error = require_model_http_transport_setting(setter).unwrap_err();
+            assert_eq!(error.native_code(), Some(NativeErrorCode::NotImplemented));
+            assert!(error.to_string().contains("version 5"));
+        }
+    }
+
+    #[test]
+    fn current_configuration_reads_only_the_model_transport_extension() {
+        unsafe extern "system" fn set_transport(
+            _: *mut flConfiguration,
+            _: *const flHttpTransport,
+        ) -> flStatusPtr {
+            std::ptr::null_mut()
+        }
+        let mut table = std::mem::MaybeUninit::<flConfigurationApiV5Vtable>::uninit();
+        unsafe {
+            std::ptr::addr_of_mut!((*table.as_mut_ptr()).SetModelHttpTransport)
+                .write(Some(set_transport));
+            let setter = read_model_http_transport_setting(table.as_ptr().cast(), 5)
+                .expect("version-5 transport setter");
+            assert!(setter(std::ptr::null_mut(), std::ptr::null()).is_null());
+        }
+        assert_eq!(
+            std::mem::offset_of!(flConfigurationApiV5Vtable, SetModelHttpTransport),
+            12 * std::mem::size_of::<usize>()
+        );
     }
 
     #[test]

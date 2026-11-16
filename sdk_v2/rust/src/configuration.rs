@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::detail::api::{to_cstring, Api, Kvps};
 use crate::detail::ffi::*;
 use crate::error::{FoundryLocalError, Result};
+use crate::ModelHttpTransport;
 
 /// Log level for the Foundry Local service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +65,7 @@ pub struct FoundryLocalConfig {
     library_path: Option<String>,
     additional_settings: Option<HashMap<String, String>>,
     logger: Option<Box<dyn Logger>>,
+    model_http_transport: Option<Arc<dyn ModelHttpTransport>>,
 }
 
 impl Default for FoundryLocalConfig {
@@ -85,6 +87,7 @@ impl Default for FoundryLocalConfig {
                 concat!("foundry-local-rust/", env!("CARGO_PKG_VERSION")).into(),
             )])),
             logger: None,
+            model_http_transport: None,
         }
     }
 }
@@ -105,6 +108,10 @@ impl fmt::Debug for FoundryLocalConfig {
             .field("library_path", &self.library_path)
             .field("additional_settings", &self.additional_settings)
             .field("logger", &self.logger.as_ref().map(|_| ".."))
+            .field(
+                "model_http_transport",
+                &self.model_http_transport.as_ref().map(|_| ".."),
+            )
             .finish()
     }
 }
@@ -181,6 +188,15 @@ impl FoundryLocalConfig {
     /// Set the Azure region used by the catalog service.
     pub fn catalog_region(mut self, region: impl Into<String>) -> Self {
         self.catalog_region = Some(region.into());
+        self
+    }
+
+    /// Replace model HTTP with an application-owned transport. Requires native API version 5.
+    ///
+    /// This does not change OpenAI clients or the native coordinator's HTTP policy.
+    /// When unset, the native transport and compatibility with older runtimes remain unchanged.
+    pub fn model_http_transport(mut self, transport: Arc<dyn ModelHttpTransport>) -> Self {
+        self.model_http_transport = Some(transport);
         self
     }
 
@@ -277,6 +293,9 @@ impl FoundryLocalConfig {
 
         let cfg = NativeConfig::create(Arc::clone(api), app_name)?;
         api.set_use_shared_host(cfg.ptr, self.use_shared_host)?;
+        if let Some(transport) = &self.model_http_transport {
+            crate::detail::model_http_transport::register(api, cfg.ptr, Arc::clone(transport))?;
+        }
         let c = api.config_api();
 
         if let Some(dir) = &self.app_data_dir {
