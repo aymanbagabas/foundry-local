@@ -33,12 +33,7 @@ class CallbackFailure final : public Exception {
   using Exception::Exception;
 };
 
-void CheckStatus(flStatus* status, const char* phase) {
-  if (!status) {
-    return;
-  }
-
-  const auto code = ConsumeModelHttpStatus(*status);
+[[noreturn]] void ThrowStatus(flErrorCode code, const char* phase) {
   // Adapter diagnostics can contain signed URLs. Never propagate them into retry logs or telemetry.
   if (code == FOUNDRY_LOCAL_ERROR_OPERATION_CANCELLED) {
     throw Azure::Core::OperationCancelledException("Custom model HTTP operation cancelled");
@@ -46,6 +41,12 @@ void CheckStatus(flStatus* status, const char* phase) {
 
   throw CallbackFailure(FL_WHERE_WITH_STACK, std::string("Custom model HTTP transport failed during ") + phase,
                         code == FOUNDRY_LOCAL_OK ? FOUNDRY_LOCAL_ERROR_NETWORK : code);
+}
+
+void CheckStatus(flStatus* status, const char* phase) {
+  if (status) {
+    ThrowStatus(ConsumeModelHttpStatus(*status), phase);
+  }
 }
 
 uint64_t TimeoutMilliseconds(const Azure::Core::Context& context) {
@@ -135,8 +136,7 @@ class Operation final {
     CheckCancelled();
     monitor_ = std::thread([this] { Monitor(); });
     flHttpResponseData response{FOUNDRY_LOCAL_HTTP_TRANSPORT_VERSION, 0, nullptr, 0};
-    CheckStatus(Callbacks().Send(handle_, &response), "Send");
-    CheckCancelled();
+    CheckResult(Callbacks().Send(handle_, &response), "Send");
     CopyResponse(response);
   }
 
@@ -152,8 +152,7 @@ class Operation final {
 
     CheckCancelled();
     size_t read = 0;
-    CheckStatus(Callbacks().Read(handle_, buffer.data(), buffer.size(), &read), "Read");
-    CheckCancelled();
+    CheckResult(Callbacks().Read(handle_, buffer.data(), buffer.size(), &read), "Read");
     if (read > buffer.size()) {
       FL_THROW(FOUNDRY_LOCAL_ERROR_NETWORK, "Custom model HTTP Read exceeded buffer capacity");
     }
@@ -167,25 +166,49 @@ class Operation final {
  private:
   const flHttpTransport& Callbacks() const noexcept { return transport_->Callbacks(); }
 
-  bool IsCancelled() {
+  flErrorCode CancellationCode() {
     std::lock_guard lock(mutex_);
-    return context_.IsCancelled() || read_context_.IsCancelled() ||
-           std::chrono::steady_clock::now() >= deadline_;
+    const auto context_deadline = context_.GetDeadline();
+    const auto read_deadline = read_context_.GetDeadline();
+    // Azure Context::Cancel replaces its deadline with the minimum timestamp.
+    if (context_deadline == (Azure::DateTime::min)() || read_deadline == (Azure::DateTime::min)()) {
+      return FOUNDRY_LOCAL_ERROR_OPERATION_CANCELLED;
+    }
+
+    const auto now = Azure::DateTime(std::chrono::system_clock::now());
+    if (std::chrono::steady_clock::now() >= deadline_ || now >= context_deadline || now >= read_deadline) {
+      return FOUNDRY_LOCAL_ERROR_NETWORK;
+    }
+
+    return FOUNDRY_LOCAL_OK;
   }
 
-  void Cancel() noexcept {
-    if (!cancelled_.exchange(true)) {
+  void Cancel(flErrorCode reason) noexcept {
+    auto expected = FOUNDRY_LOCAL_OK;
+    if (reason != FOUNDRY_LOCAL_OK && cancellation_code_.compare_exchange_strong(expected, reason)) {
       Callbacks().Cancel(handle_);
     }
   }
 
   void CheckCancelled() {
-    if (IsCancelled()) {
-      Cancel();
+    Cancel(CancellationCode());
+    const auto code = cancellation_code_.load();
+    if (code == FOUNDRY_LOCAL_ERROR_NETWORK) {
+      throw CallbackFailure(FL_WHERE_WITH_STACK, "Custom model HTTP operation timed out", code);
     }
 
-    if (cancelled_.load()) {
-      throw Azure::Core::OperationCancelledException("Custom model HTTP operation cancelled or timed out");
+    if (code == FOUNDRY_LOCAL_ERROR_OPERATION_CANCELLED) {
+      throw Azure::Core::OperationCancelledException("Custom model HTTP operation cancelled");
+    }
+  }
+
+  void CheckResult(flStatus* status, const char* phase) {
+    const bool failed = status != nullptr;
+    const auto code = failed ? ConsumeModelHttpStatus(*status) : FOUNDRY_LOCAL_OK;
+    // Cancel carries no reason across the ABI; the native monitor owns deadline attribution.
+    CheckCancelled();
+    if (failed) {
+      ThrowStatus(code, phase);
     }
   }
 
@@ -197,8 +220,9 @@ class Operation final {
       }
 
       lock.unlock();
-      if (IsCancelled()) {
-        Cancel();
+      const auto code = CancellationCode();
+      if (code != FOUNDRY_LOCAL_OK) {
+        Cancel(code);
         return;
       }
 
@@ -237,7 +261,7 @@ class Operation final {
   Azure::Core::Context context_;
   Azure::Core::Context read_context_;
   std::chrono::steady_clock::time_point deadline_ = (std::chrono::steady_clock::time_point::max)();
-  std::atomic<bool> cancelled_{false};
+  std::atomic<flErrorCode> cancellation_code_{FOUNDRY_LOCAL_OK};
   std::mutex mutex_;
   std::condition_variable wake_;
   bool stopped_ = false;

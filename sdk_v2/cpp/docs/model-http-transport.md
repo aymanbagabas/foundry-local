@@ -108,6 +108,8 @@ The transport must enforce the deadline during blocked calls.
 HTTP errors are responses, not callback failures.
 For example, `Send` returns success with status 403 for an HTTP 403 response.
 Use `FOUNDRY_LOCAL_ERROR_NETWORK` for connection, TLS, timeout, and response-stream failures.
+The native coordinator preserves its deadline reason when `Cancel` interrupts a callback.
+It reports deadline expiry as a network failure, not explicit cancellation.
 Do not include credentials, signed URLs, or raw request bodies in error messages.
 
 Foundry retains its existing retry decisions, region selection, chunk concurrency, ETag checks, checksums, and resume state.

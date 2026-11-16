@@ -301,8 +301,8 @@ internal sealed class ModelHttpTransportBridge : IDisposable
         try
         {
             var state = Target<Operation>(operation);
-            // Deadline expiry is NETWORK; explicit native cancellation is OPERATION_CANCELLED.
-            return Failure(state.IsCancelled || (error is OperationCanceledException && !state.IsTimedOut));
+            // Local expiry wins over cancellation. The native coordinator attributes its own deadline monitor.
+            return Failure(!state.IsTimedOut && (state.IsCancelled || error is OperationCanceledException));
         }
         catch (Exception)
         {
