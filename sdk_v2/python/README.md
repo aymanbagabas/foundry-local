@@ -24,6 +24,10 @@ streaming HTTP for model acquisition with native API 5. See the
 [transport protocols, ownership and cancellation requirements](docs/model-http-transport.md)
 and the [registered native catalog example](examples/custom_model_http_transport.py).
 Older API 2–4 runtimes remain supported when no transport is configured.
+For a standard-client implementation, install `foundry-local-sdk[httpx]` and
+explicitly import `HttpxModelHttpTransport` from `foundry_local_sdk.httpx_transport`.
+It supports cancellable async HTTPX I/O behind the synchronous protocols.
+See the [real SDK loopback HTTP example](examples/httpx_model_http_transport.py).
 
 ## Installation
 

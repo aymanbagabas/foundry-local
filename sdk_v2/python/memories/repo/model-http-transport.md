@@ -15,3 +15,15 @@
   stable-ABI filename rewriting; use its default artifact name.
 - The native catalog currently calls CreateOperation on the calling thread;
   cancellation monitors can reenter Python from native threads.
+- The optional `httpx_transport` module alone imports HTTPX. Its owned AsyncClient
+  runs on a private loop thread; cancel its asyncio Task, not the concurrent
+  Future, so native callbacks wait for actual I/O unwinding before returning.
+- Use standalone HTTPX Requests with raw header arrays and `aiter_raw()`.
+  Disable redirects/auth replay per send, retries on the network transport,
+  and per-I/O timeouts in request extensions (the native total deadline wins).
+- HTTPX normalizes literal dot path segments. Reject changed raw targets before
+  I/O instead of silently breaking signatures. Encoded paths/query bytes survive.
+- Adapter close drains operations before client/loop shutdown. Record operation
+  cleanup errors for explicit adapter.close(), because native ReleaseOperation
+  has no status return. Custom factories must create owned clients using the
+  supplied transport and must not suppress cancellation or introduce replay.

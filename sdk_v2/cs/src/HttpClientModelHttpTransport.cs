@@ -18,50 +18,104 @@ using Microsoft.AI.Foundry.Local.Detail;
 /// Owns its client/handler. Dispose only after all managers using it have been disposed.
 /// Uses one-shot HTTP/1.1 connections to prevent internal replay and protocol-downgrade retries.
 /// Requires .NET 8 or later; the netstandard2.0 API cannot disable internal HttpClient replay.
-/// Custom proxy, authentication or TLS policies can instead be implemented using IModelHttpTransport.
+/// Network policies can be configured on the SDK-owned handler before mandatory transport invariants are enforced.
 /// </remarks>
 public sealed class HttpClientModelHttpTransport : IModelHttpTransport, IDisposable
 {
-    private readonly HttpClient _client = CreateClient();
+    private readonly HttpClient _client;
     private int _disposed;
 
+    /// <summary>Create an adapter with the default platform network policies.</summary>
+    public HttpClientModelHttpTransport()
+    {
+        _client = CreateClient();
+    }
+
+#if NET8_0_OR_GREATER
+    /// <summary>Configure network policies on a fresh SDK-owned handler before transport invariants are enforced.</summary>
+    /// <param name="configureHandler">
+    /// Invoked once, synchronously. May configure proxy, TLS/trust/client certificates, connection timeout or a
+    /// custom ConnectCallback (for example DNS routing). Do not retain, dispose, use or mutate the handler afterward.
+    /// Referenced proxy/certificate objects and callback captures must remain usable until transport disposal.
+    /// </param>
+    /// <remarks>
+    /// Redirects, decompression, cookies, pooled reuse and automatic challenge authentication are disabled afterward.
+    /// Header encodings are fixed to Latin-1. Any custom ConnectCallback is wrapped with the one-attempt guard;
+    /// it must return a plain connected stream, honor cancellation and never retry. HttpClient still performs TLS.
+    /// </remarks>
+    public HttpClientModelHttpTransport(Action<SocketsHttpHandler> configureHandler)
+    {
+        Throw.IfNull(configureHandler);
+        _client = CreateClient(configureHandler);
+    }
+#endif
+
+#if NETSTANDARD2_0
     private static HttpClient CreateClient()
     {
-#if NETSTANDARD2_0
         // Never silently provide an adapter that violates the transport's no-replay contract.
         throw new PlatformNotSupportedException(
             "The strict HttpClient model transport requires .NET 8 or later. Use IModelHttpTransport on netstandard2.0.");
+    }
 #else
+    private static HttpClient CreateClient(Action<SocketsHttpHandler>? configureHandler = null)
+    {
         // One client per transport, never one per operation. The transport owns its handler/client;
         // making it static would cross application transport ownership and disposal boundaries.
-#pragma warning disable IDISP004, IDISP014
-        return new HttpClient(new SocketsHttpHandler
+#pragma warning disable IDISP001, IDISP014
+        var handler = new SocketsHttpHandler();
+        try
         {
-            AllowAutoRedirect = false,
-            AutomaticDecompression = DecompressionMethods.None,
-            UseCookies = false,
-            PooledConnectionLifetime = TimeSpan.Zero,
-            ConnectCallback = ConnectOnceAsync,
-            RequestHeaderEncodingSelector = (_, _) => System.Text.Encoding.Latin1,
-            ResponseHeaderEncodingSelector = (_, _) => System.Text.Encoding.Latin1
-        })
+            configureHandler?.Invoke(handler);
+            if (handler.Proxy?.Credentials is not null)
+            {
+                // Do not mutate an application-owned proxy to remove its credentials.
+                throw new ArgumentException("Automatic proxy challenge authentication can replay model HTTP requests.");
+            }
+
+            var connect = handler.ConnectCallback;
+            handler.AllowAutoRedirect = false;
+            handler.AutomaticDecompression = DecompressionMethods.None;
+            handler.UseCookies = false;
+            handler.Credentials = null;
+            handler.PreAuthenticate = false;
+            handler.DefaultProxyCredentials = null;
+            handler.PooledConnectionLifetime = TimeSpan.Zero;
+            handler.ConnectCallback = (context, token) => ConnectOnceAsync(context, connect, token);
+            handler.RequestHeaderEncodingSelector = (_, _) => System.Text.Encoding.Latin1;
+            handler.ResponseHeaderEncodingSelector = (_, _) => System.Text.Encoding.Latin1;
+            return new HttpClient(handler)
+            {
+                Timeout = Timeout.InfiniteTimeSpan
+            };
+        }
+        catch
         {
-            Timeout = Timeout.InfiniteTimeSpan
-        };
-#pragma warning restore IDISP004, IDISP014
-#endif
+            handler.Dispose();
+            throw;
+        }
+#pragma warning restore IDISP001, IDISP014
     }
+#endif
 
 #if NET8_0_OR_GREATER
     private static readonly HttpRequestOptionsKey<Operation> OperationKey = new("FoundryLocal.ModelHttpOperation");
 
     private static async ValueTask<Stream> ConnectOnceAsync(
-        SocketsHttpConnectionContext context, CancellationToken cancellationToken)
+        SocketsHttpConnectionContext context,
+        Func<SocketsHttpConnectionContext, CancellationToken, ValueTask<Stream>>? connect,
+        CancellationToken cancellationToken)
     {
         if (!context.InitialRequestMessage.Options.TryGetValue(OperationKey, out var operation) ||
             !operation.TryBeginConnection())
         {
             throw new HttpRequestException("Model HTTP request replay is disabled.");
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        if (connect is not null)
+        {
+            return await connect(context, cancellationToken).ConfigureAwait(false);
         }
 
         // Ownership transfers to NetworkStream on success; connection failures dispose the socket here.

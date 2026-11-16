@@ -64,6 +64,7 @@ tokio-stream = "0.1"       # for StreamExt on streaming responses
 | Feature   | Description |
 |-----------|-------------|
 | `nightly` | Resolve the latest nightly build of the Core package from the ORT-Nightly feed. |
+| `model-http-reqwest` | Enable `ReqwestTransport`, an optional standard-client adapter for native model HTTP. |
 
 Enable features in `Cargo.toml`:
 
@@ -199,6 +200,62 @@ The example registers its transport through the real native configuration, manag
 It returns `{"value":[]}` with short reads, without network access or model weights.
 Its output reports the requests, reads, empty model list, and balanced ownership.
 Generated data stays under `target/`.
+
+### Reqwest adapter
+
+Enable `model-http-reqwest` to use the standard Reqwest client through the same neutral interface:
+
+```toml
+[dependencies]
+foundry-local-sdk = { version = "2", features = ["model-http-reqwest"] }
+reqwest = "0.12.28"
+```
+
+```rust
+use foundry_local_sdk::{FoundryLocalConfig, ReqwestTransport};
+use std::sync::Arc;
+use std::time::Duration;
+
+let transport = ReqwestTransport::with_client_builder(
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .pool_max_idle_per_host(4),
+)?;
+let config = FoundryLocalConfig::new("my-app")
+    .model_http_transport(Arc::new(transport));
+# Ok::<(), foundry_local_sdk::FoundryLocalError>(())
+```
+
+`ReqwestTransport::new()` uses default network settings.
+`with_client_builder` accepts application proxy, TLS, DNS, authentication, connection, and timeout policy.
+The factory always disables automatic retries, redirects, and gzip, Brotli, deflate, and Zstandard decompression.
+It does not accept opaque clients with unknown settings.
+Other Reqwest users can enable compression features without changing this adapter's behavior.
+Native code retains retry policy.
+
+The adapter streams response chunks and supports concurrent operations.
+Cancellation drops pending HTTP futures and interrupts blocked send or read calls.
+One deadline covers `send` and all reads, including delays between calls.
+An independent Tokio thread prevents dependence on the application's runtime.
+The final transport or operation drop shuts down and joins that thread, including from an async context.
+Shutdown can wait for platform DNS lookups already in progress.
+
+Already encoded signed URLs retain their exact bytes.
+The adapter rejects URLs that Reqwest normalizes, plus fragments and embedded credentials.
+Reqwest controls header name case and wire order; duplicate values and response bytes remain intact.
+Adapter errors omit request secrets.
+Application-defined connector or resolver code remains the application's responsibility.
+
+Run the [registered Reqwest example](examples/reqwest_model_http_transport.rs) against a local native build:
+
+```sh
+export FOUNDRY_LOCAL_LIB_DIR=/absolute/path/to/native/bin
+DOCS_RS=1 cargo run --features model-http-reqwest --example reqwest_model_http_transport
+```
+
+The native manager requests an empty catalog from a real loopback HTTP server.
+The server returns a chunked body.
+The example checks the signed request target, empty result, and clean shutdown without model weights.
 
 ## Native shared serving
 
