@@ -194,8 +194,8 @@ inline Configuration& Configuration::SetUseSharedHost(bool enabled) {
 }
 
 inline Configuration& Configuration::SetModelHttpTransport(const flHttpTransport* transport) {
-  if (detail::api_version() < 4) {
-    throw Error("custom model HTTP transport requires an API v4 Foundry Local runtime",
+  if (detail::api_version() < 5) {
+    throw Error("custom model HTTP transport requires an API v5 Foundry Local runtime",
                 FOUNDRY_LOCAL_ERROR_NOT_IMPLEMENTED);
   }
 
@@ -250,6 +250,21 @@ inline ICatalog& Manager::GetCatalog(flCatalogType type) const {
     default:
       throw Error("invalid catalog type", FOUNDRY_LOCAL_ERROR_INVALID_ARGUMENT);
   }
+}
+
+inline ICatalog& Manager::GetCatalog(flCatalogType type, const KeyValuePairs& options) const {
+  if (options.GetAll().empty() && type != FOUNDRY_LOCAL_CATALOG_AZURE_REGISTRY) return GetCatalog(type);
+  if (detail::api_version() < 4) {
+    throw Error("catalog options require native API version 4 or newer", FOUNDRY_LOCAL_ERROR_NOT_IMPLEMENTED);
+  }
+  flCatalog* source = nullptr;
+  Check(detail::api()->Manager_GetCatalogWithOptions(handle_.get(), type, options.native_handle(), &source));
+  if (type == FOUNDRY_LOCAL_CATALOG_PUBLIC) return catalogs_.public_;
+  if (type == FOUNDRY_LOCAL_CATALOG_LOCAL) return catalogs_.local_;
+  std::lock_guard lock(catalogs_.configured_->mutex);
+  auto& catalog = catalogs_.configured_->catalogs[source];
+  if (!catalog) catalog = std::make_unique<Catalog>(*source);
+  return *catalog;
 }
 
 inline void Manager::StartWebService() {
@@ -1405,6 +1420,59 @@ inline std::vector<std::vector<float>> EmbeddingsSession::Embed(const std::vecto
   }
 
   return results;
+}
+
+namespace detail {
+
+inline IModel& RequireTask(IModel& model, std::string_view expected) {
+  if (model.GetInfo().Task() != expected)
+    throw std::invalid_argument("Model is not designed for " +
+                                std::string(expected) + " tasks");
+  return model;
+}
+
+inline void ValidateNonGenerativeJsonInput(
+    const std::string& request_json) {
+  if (request_json.find('\0') != std::string::npos) {
+    throw std::invalid_argument(
+        "non-generative JSON requests cannot contain embedded NUL bytes");
+  }
+}
+
+inline std::string ProcessNonGenerativeJson(
+    Session& session, const std::string& request_json) {
+  ValidateNonGenerativeJsonInput(request_json);
+  Request request(Item::Text(request_json));
+  auto response = session.ProcessRequest(request);
+  if (response.GetItems().size() != 1 ||
+      response.GetItems().front().GetType() != FOUNDRY_LOCAL_ITEM_TEXT) {
+    throw Error("non-generative session returned an invalid response",
+                FOUNDRY_LOCAL_ERROR_INTERNAL);
+  }
+  const auto content = response.GetItems().front().GetText();
+  if (content.type != FOUNDRY_LOCAL_TEXT_ITEM_TYPE_OPENAI_JSON) {
+    throw Error("non-generative session returned a non-JSON response",
+                FOUNDRY_LOCAL_ERROR_INTERNAL);
+  }
+  return std::string(content.text);
+}
+
+}  // namespace detail
+
+inline RankingSession::RankingSession(IModel& model)
+    : Session(detail::RequireTask(model, "text-ranking")) {}
+
+inline std::string RankingSession::RankJson(
+    const std::string& request_json) {
+  return detail::ProcessNonGenerativeJson(*this, request_json);
+}
+
+inline DecisionSession::DecisionSession(IModel& model)
+    : Session(detail::RequireTask(model, "typed-decision")) {}
+
+inline std::string DecisionSession::DecideJson(
+    const std::string& request_json) {
+  return detail::ProcessNonGenerativeJson(*this, request_json);
 }
 
 // ===========================================================================

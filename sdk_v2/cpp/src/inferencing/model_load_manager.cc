@@ -40,10 +40,6 @@ namespace {
 /// The expected config filename inside a model directory.
 constexpr const char* kGenAIConfigFileName = "genai_config.json";
 
-std::string GenerativeRuntimeKey(std::string_view model_id) {
-  return "generative|" + std::string(model_id);
-}
-
 class ManagedGenerativeRuntime final : public ManagedModelRuntime {
  public:
   explicit ManagedGenerativeRuntime(
@@ -119,6 +115,11 @@ std::pair<std::string, std::string> SelectionIdentity(std::string_view model_id,
   return {std::string(model_id), std::move(path)};
 }
 
+std::string GenerativeRuntimeKey(std::string_view model_id, std::string_view model_path) {
+  const auto [id, path] = SelectionIdentity(model_id, model_path);
+  return "generative|" + std::to_string(id.size()) + "|" + id + "|" + path;
+}
+
 }  // namespace
 
 LoadedSelectionReservation::LoadedSelectionReservation(ModelLoadManager& manager,
@@ -136,6 +137,14 @@ void LoadedSelectionReservation::Commit() noexcept {
     manager_.CompleteSelectionReservation(identity_, true);
     active_ = false;
   }
+}
+
+ModelLoadManager::PredictiveRequestLease::PredictiveRequestLease(
+    PredictiveRequestLease&& other) noexcept
+    : manager_(std::exchange(other.manager_, nullptr)) {}
+
+ModelLoadManager::PredictiveRequestLease::~PredictiveRequestLease() {
+  if (manager_) manager_->ReleasePredictiveRequest();
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +178,55 @@ bool ModelLoadManager::HasEP(const std::string& ep_name) const {
   }
 
   return false;
+}
+
+void ModelLoadManager::RegisterPredictiveSession(
+    void* identity, std::function<void()> cancel,
+    std::function<void()> release) {
+  std::lock_guard lock(predictive_mutex_);
+  if (shutdown_.load())
+    FL_THROW(FOUNDRY_LOCAL_ERROR_INVALID_USAGE,
+             "cannot create non-generative session during shutdown");
+  predictive_sessions_.insert_or_assign(
+      identity,
+      PredictiveSessionCallbacks{std::move(cancel), std::move(release)});
+}
+
+void ModelLoadManager::UnregisterPredictiveSession(void* identity) noexcept {
+  std::lock_guard lock(predictive_mutex_);
+  predictive_sessions_.erase(identity);
+}
+
+ModelLoadManager::PredictiveRequestLease
+ModelLoadManager::AcquirePredictiveRequest() {
+  std::lock_guard lock(predictive_mutex_);
+  if (shutdown_.load())
+    FL_THROW(FOUNDRY_LOCAL_ERROR_INVALID_USAGE,
+             "cannot process non-generative request during shutdown");
+  ++active_predictive_requests_;
+  return PredictiveRequestLease(*this);
+}
+
+void ModelLoadManager::ReleasePredictiveRequest() noexcept {
+  std::lock_guard lock(predictive_mutex_);
+  --active_predictive_requests_;
+  predictive_condition_.notify_all();
+}
+
+void ModelLoadManager::WaitForPredictiveRequests() {
+  std::unique_lock lock(predictive_mutex_);
+  predictive_condition_.wait(
+      lock, [&] { return active_predictive_requests_ == 0; });
+}
+
+void ModelLoadManager::ReleasePredictiveSessions() {
+  std::vector<std::function<void()>> releases;
+  {
+    std::lock_guard lock(predictive_mutex_);
+    for (const auto& entry : predictive_sessions_)
+      releases.push_back(entry.second.release);
+  }
+  for (const auto& release : releases) release();
 }
 
 void ModelLoadManager::RunWithUnloadedModelsInDirectory(std::string_view directory,
@@ -228,7 +286,8 @@ std::shared_ptr<void> ModelLoadManager::AcquireNonGenerativeRuntime(
              "package task does not match registered model task");
   const auto provider_name = package.execution_provider;
   const auto identity =
-      "non-generative|" + model.Id() + "|" + canonical + "|" + provider_name;
+      "non-generative|" + model.Id() + "|" + canonical + "|" +
+      provider_name + "|" + task;
   return AcquireManagedRuntime(
       identity, model.Id(), canonical, package.estimated_resident_bytes,
       provider_name.empty() ? "cpu" : provider_name,
@@ -248,6 +307,23 @@ std::shared_ptr<void> ModelLoadManager::AcquireNonGenerativeRuntime(
       },
       on_admitted,
       std::make_shared<GenAIConfig>(package.config));
+}
+
+std::shared_ptr<void>
+ModelLoadManager::AcquireLoadedNonGenerativeRuntime(Model& model) {
+  const auto model_path = NormalizeModelPath(model.GetPath());
+  std::lock_guard lock(mutex_);
+  const auto found = std::find_if(
+      loaded_runtimes_.begin(), loaded_runtimes_.end(),
+      [&](const auto& entry) {
+        return !entry.second->GenAI() &&
+               entry.second->ModelId() == model.Id() &&
+               ModelPathsEqual(entry.second->ModelPath(), model_path);
+      });
+  if (found == loaded_runtimes_.end())
+    FL_THROW(FOUNDRY_LOCAL_ERROR_INVALID_USAGE,
+             "model must be loaded before creating a session");
+  return found->second->Lease();
 }
 
 NonGenerativePackageMetadata
@@ -358,14 +434,7 @@ bool ModelLoadManager::UnloadNonGenerativeRuntime(Model& model) {
 }
 
 bool ModelLoadManager::IsModelLoaded(const Model& model) const {
-  const auto model_path = NormalizeModelPath(model.GetPath());
-  std::lock_guard lock(mutex_);
-  return std::any_of(
-      loaded_runtimes_.begin(), loaded_runtimes_.end(),
-      [&](const auto& entry) {
-        return entry.second->ModelId() == model.Id() &&
-               ModelPathsEqual(entry.second->ModelPath(), model_path);
-      });
+  return IsModelArtifactLoaded(model.Id(), model.GetPath());
 }
 
 bool ModelLoadManager::IsModelLoading(const Model& model) const {
@@ -443,17 +512,11 @@ ModelLoadManager::LoadResult ModelLoadManager::LoadModel(std::string_view model_
 
   const auto path_str = NormalizeModelPath(model_path);
   std::string id_str(model_id);
-  const auto runtime_key = GenerativeRuntimeKey(id_str);
+  const auto runtime_key = GenerativeRuntimeKey(id_str, path_str);
   std::lock_guard<std::mutex> lock(mutex_);
 
   auto it = loaded_runtimes_.find(runtime_key);
   if (it != loaded_runtimes_.end()) {
-    if (!ModelPathsEqual(path_str, it->second->ModelPath())) {
-      FL_LOG_AND_THROW(logger_, FOUNDRY_LOCAL_ERROR_INVALID_USAGE, "model '", id_str,
-                       "' is already loaded from a different path: ", it->second->ModelPath(),
-                       "; requested path: ", path_str);
-    }
-
     return {LoadStatus::kModelAlreadyLoaded, it->second->GenAI()};
   }
 
@@ -484,10 +547,11 @@ ModelLoadManager::LoadResult ModelLoadManager::LoadModel(std::string_view model_
   }
 
   if (resolved_ep == ExecutionProvider::kDefault) {
-    // Auto-select EP for generic-gpu models: DML models are compatible with
-    // CUDA and WebGPU, so try those in order when available.
+    // OGA overrides only the decoder provider, so avoid promoting multimodal models to CUDA while component sessions
+    // remain configured for another device. Text-only models retain the CUDA preference.
     if (id_str.find("generic-gpu") != std::string::npos) {
-      if (HasEP("CUDAExecutionProvider")) {
+      const bool is_multimodal = genai_config.model && genai_config.model->IsMultiModal();
+      if (!is_multimodal && HasEP("CUDAExecutionProvider")) {
         resolved_ep = ExecutionProvider::kCUDA;
         logger_.Log(LogLevel::Information, fmt::format("using CUDA EP for model: {}", id_str));
       } else if (HasEP("WebGpuExecutionProvider")) {
@@ -555,17 +619,13 @@ bool ModelLoadManager::UnloadModel(std::string_view model_id, const std::string*
   std::lock_guard<std::mutex> lock(mutex_);
 
   std::string id_str(model_id);
-  auto it = loaded_runtimes_.find(GenerativeRuntimeKey(id_str));
-  if (it == loaded_runtimes_.end()) {
+  auto* loaded = FindLoadedModelLocked(model_id, normalized_model_path);
+  if (!loaded) {
     logger_.Log(LogLevel::Information, fmt::format("model was not loaded: {}", id_str));
     return false;
   }
 
-  if (normalized_model_path && !ModelPathsEqual(*normalized_model_path, it->second->ModelPath())) {
-    logger_.Log(LogLevel::Information,
-                fmt::format("model '{}' is loaded from a different path", id_str));
-    return false;
-  }
+  auto it = loaded_runtimes_.find(GenerativeRuntimeKey(model_id, loaded->ModelPath()));
 
   // Refuse to unload while sessions hold the instance — the OGA objects must outlive
   // every session that referenced them. Asking to unload an in-use model is a caller
@@ -586,9 +646,32 @@ bool ModelLoadManager::UnloadModel(std::string_view model_id, const std::string*
 
 void ModelLoadManager::RejectNewLoads() {
   shutdown_.store(true);
+  std::vector<std::function<void()>> cancellations;
+  {
+    std::lock_guard lock(predictive_mutex_);
+    for (const auto& entry : predictive_sessions_)
+      cancellations.push_back(entry.second.cancel);
+  }
+  for (const auto& cancel : cancellations) cancel();
 }
 
 void ModelLoadManager::UnloadAll(std::chrono::milliseconds timeout) {
+  using clock = std::chrono::steady_clock;
+  const auto deadline = clock::now() + timeout;
+  {
+    std::unique_lock lock(predictive_mutex_);
+    if (!predictive_condition_.wait_until(
+            lock, deadline,
+            [&] { return active_predictive_requests_ == 0; })) {
+      logger_.Log(
+          LogLevel::Warning,
+          fmt::format(
+              "Shutdown: {} non-generative request(s) remain active after "
+              "overall {}ms deadline",
+              active_predictive_requests_, timeout.count()));
+    }
+  }
+
   std::vector<std::pair<std::string, std::shared_ptr<ManagedModelRuntime>>>
       snapshot;
   {
@@ -613,14 +696,11 @@ void ModelLoadManager::UnloadAll(std::chrono::milliseconds timeout) {
   logger_.Log(LogLevel::Information,
               fmt::format("Shutdown: unloading {} model(s)", snapshot.size()));
 
-  using clock = std::chrono::steady_clock;
   constexpr auto kPollInterval = std::chrono::milliseconds(50);
 
   // Overall deadline shared across all models — shutdown must be bounded regardless of
   // how many models are loaded. A stuck caller on one model shouldn't extend total drain
   // time linearly with model count.
-  auto deadline = clock::now() + timeout;
-
   for (auto& [id, runtime] : snapshot) {
     while (runtime->SessionRefCount() > 0 && clock::now() < deadline) {
       std::this_thread::sleep_for(kPollInterval);
@@ -636,7 +716,7 @@ void ModelLoadManager::UnloadAll(std::chrono::milliseconds timeout) {
     }
 
     try {
-      UnloadModel(id);
+      UnloadModel(id, runtime->ModelPath());
     } catch (const std::exception& ex) {
       // A new session attached between our refcount poll and the lock acquisition inside
       // UnloadModel. Log and move on — IsShutdownRequested-gated callers shouldn't be
@@ -747,14 +827,20 @@ GenAIModelInstance* ModelLoadManager::GetLoadedModel(std::string_view model_id,
 
 GenAIModelInstance* ModelLoadManager::FindLoadedModelLocked(std::string_view model_id,
                                                             const std::string* normalized_model_path) {
-  std::string id_str(model_id);
-  auto it = loaded_runtimes_.find(GenerativeRuntimeKey(id_str));
-  if (it != loaded_runtimes_.end() &&
-      (!normalized_model_path || ModelPathsEqual(*normalized_model_path, it->second->ModelPath()))) {
-    return it->second->GenAI();
+  if (normalized_model_path) {
+    const auto it = loaded_runtimes_.find(GenerativeRuntimeKey(model_id, *normalized_model_path));
+    return it == loaded_runtimes_.end() ? nullptr : it->second->GenAI();
   }
-
-  return nullptr;
+  GenAIModelInstance* found = nullptr;
+  for (const auto& [key, runtime] : loaded_runtimes_) {
+    if (runtime->GenAI() && runtime->ModelId() == model_id) {
+      if (found) {
+        FL_THROW(FOUNDRY_LOCAL_ERROR_INVALID_USAGE, "model ID has multiple loaded artifacts; specify its path: ", model_id);
+      }
+      found = runtime->GenAI();
+    }
+  }
+  return found;
 }
 
 std::optional<ModelLoadManager::LoadedModelState> ModelLoadManager::GetLoadedModelState(

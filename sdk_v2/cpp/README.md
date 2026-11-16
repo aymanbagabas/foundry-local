@@ -20,12 +20,20 @@ and streaming across languages, see [Inference with the Foundry Local SDK](../IN
 
 ## Features
 
+For Azure ML registries, see the short [registry catalog example](examples/azure_registry_catalog/main.cc).
+Run `az login` first; registry access requires native API v4 or newer and defaults to `azure_cli`
+credentials (`workload_identity` is also supported).
+The example downloads and loads `qwen2.5-0.5b` from `azureml-dev`, sends one chat prompt,
+and unloads it. Review the model license before running; adjust the registry/model names as needed.
+
 - **Model catalog** -- discover model aliases, variants, cached models, and loaded models
 - **Model lifecycle** -- download, load, unload, remove, and register local model assets
 - **Chat** -- stateful chat sessions, including text-only `coding` models, with streaming and per-request settings
 - **Tool calling** -- session-scoped and request-scoped tool definitions, plus typed tool call/result items
 - **Embeddings** -- single and batch `std::vector<float>` helpers
 - **Audio** -- offline and real-time streaming audio transcription
+- **Ranking and typed decisions** -- native `RankingSession` and
+  `DecisionSession` APIs for CLM and KEV packages
 - **Execution providers** -- discover, download, and register hardware acceleration on demand
 - **Embedded web service** -- optionally expose an OpenAI-compatible local endpoint
 - **C API** -- a stable ABI for other language bindings and low-level integrations
@@ -34,6 +42,8 @@ Models with task `coding` use `ChatSession`. See [coding models](../INFERENCING.
 capabilities, registration, and compatibility considerations.
 
 For custom model acquisition clients, see [Custom model HTTP transports](docs/model-http-transport.md).
+Registration requires native API v5. Azure Registry catalogs currently reject custom transports explicitly;
+they never silently bypass the application's acquisition transport.
 The guide describes the native callback contract and proposed adapters for Rust, JavaScript, C#, and Python.
 
 ## Install From NuGet
@@ -187,10 +197,42 @@ curl -s http://127.0.0.1:5272/catalogs/local/v1/systemone \
 
 Missing fallback configuration is reported as HTTP 503. Invalid contracts,
 tasks, criteria, or token bounds are HTTP 400. This bounded integration does
-not add remote catalog submission or C/Python SDK APIs.
+not add remote catalog submission.
 Until the corresponding ORT GenAI package is published, configure this branch
 with `--ort_genai_home /path/to/onnxruntime-genai` so the native
 `OgaConfig`-based `NonGenerativeSession` API is available.
+
+Cached catalog models can also be used directly without starting the web
+service. The normal lifecycle uses the same model-owned manager as other
+tasks: load the model, create a task session, process requests, destroy the
+session, and unload the model. Session construction requires the selected
+artifact to be loaded and only acquires a lease on that model-owned runtime.
+
+```cpp
+clm_model.Load();
+{
+  foundry_local::RankingSession ranking(clm_model);
+  const auto ranked = ranking.RankJson(R"({
+    "context":{"weather":"heavy rain"},
+    "question":"Which activity is more suitable?",
+    "answers":["Have a picnic outdoors","Visit an indoor museum"]
+  })");
+}
+clm_model.Unload();
+```
+
+The session already selects the model. The JSON `model` field may be omitted;
+a matching bound model ID or alias is accepted, while a different model is
+rejected rather than routed elsewhere. Temperature precedence is JSON value,
+then request options, then session defaults. Ordinary text items containing
+JSON are accepted; responses retain the compatibility OpenAI-JSON text tag.
+These are Foundry task payloads, not standard OpenAI request schemas.
+
+The SDK methods use the same payload and response shapes as
+`POST /catalogs/local/v1/rank` and
+`POST /catalogs/local/v1/systemone`. The C ABI remains unchanged: all language
+bindings use the existing `flSession`, `flRequest`, `flResponse`, and JSON
+text-item contract.
 
 ## Build From Source
 
@@ -295,23 +337,63 @@ of a dependency performance regression.
 
 Structured tool turns on both Engine and Generator use one immutable `ToolCallPlan` for declaration
 admission, call-name selection, original-schema validation, and batch acceptance.
-The model emits a nonempty canonical JSON array inside its published tool
+When the tokenizer's rendered probes qualify a native XML or tagged-JSON tool
+protocol, automatic, required, and named choices retain that protocol on either
+backend without implicit whole-turn guidance. Template-supported reasoning history
+is preserved alongside assistant calls and correlated tool results so serial
+continuations retain their context. Original-schema validation still applies
+before calls are published. Function argument history uses the same 64-level JSON
+nesting limit as generated calls, checked before DOM parsing and prompt projection.
+Native activation also requires the effective opening and closing markers to match
+the qualified tokenizer markers; overriding either boundary retains canonical
+projection. Native history arguments are literal-tokenized, including object keys,
+and their escaping follows the template's actual raw or JSON serialization.
+Raw rendered NUL bytes are rejected before tokenizer entry; JSON-escaped NUL values
+remain lossless.
+User-defined schema dictionary keys are protected as well, while structural fields,
+required-name membership, and rendered schema references retain their meaning.
+Native XML requires representable function and parameter names. Semantic constraints
+such as `minLength` do not change string transport eligibility. The original schema
+validates every decoded batch before publication. Ambiguous string/non-string XML
+values are rejected rather than guessed. Supported schemas or argument values that
+cannot be represented losslessly in XML may use bounded native tagged-JSON recovery.
+Native decoders reuse the request's original plan, including forced names and
+serial-call limits, rather than compiling a separate schema authority.
+Protocol selection uses the loaded Engine's cached guidance capability. If native
+XML cannot represent a schema, a qualified tagged-JSON protocol is preferred;
+otherwise canonical guidance requires reported support before generation starts.
+Unsupported combinations fail before invoking the generator. Older GenAI packages
+without the capability getter cannot enable this native-schema guided fallback;
+ordinary native calls and their bounded native correction remain unguided.
+String-or-container offers such as Copilot's `paths` do not disable otherwise
+representable native calls. An unambiguous XML string remains a string; a body
+valid as both string and container is rejected, not assigned a guessed type.
+Tagged JSON carries either type explicitly for the same original schema.
+
+This is protocol infrastructure, not production coding-agent qualification for every
+model/backend/runtime combination. XML-only backends without guidance reject
+ambiguous string/null offers before generation unless a separately qualified
+tagged-JSON protocol is available. Nullable schema rendering alone does not remove
+that admission limit. Full coding/error/repair qualification and rollout remain
+separate work; deterministic protocol tests do not establish production readiness.
+
+Otherwise, the model emits a nonempty canonical JSON array inside its published tool
 markers, for example:
 
 ```json
 [{"name":"edit","parameters":{"path":"main.py","new_str":"print(\"hello\")\n"}}]
 ```
 
-This replaces the model's native XML argument protocol; callers continue using
+This canonical path replaces the model's native argument protocol; callers continue using
 the ordinary Chat Completions, Responses, or SDK tool APIs. Arguments are never
 coerced, repaired, default-filled, or guessed from XML text.
 
 **Generation and validation have different responsibilities.** Structural Lark
 guidance restricts JSON syntax, the canonical envelope, declared/forced tool names,
 and serial versus parallel calls. It preserves arbitrary argument property order,
-JSON structural whitespace, and standard string escapes, including printable Unicode escapes. It does
-not use the runtime's JSON Schema-to-grammar projection: a mask must not turn a
-valid argument spelling into a different value to satisfy a compiler limitation.
+JSON structural whitespace (bounded formatting runs), and standard string escapes,
+including printable Unicode escapes. It does not use the runtime's JSON Schema-to-grammar
+projection: a mask must not turn a valid argument spelling into a different value to satisfy a compiler limitation.
 The unchanged original parameter schema is validated with jsoncons before any
 call in the batch is published. Structural guidance alone does not guarantee
 schema compliance or that the model chose the user's intended argument value.
@@ -342,7 +424,7 @@ boundary exemplars use their actual token identities. This separation preserves
 multiline code, backslashes, Unicode, bracket-prefixed strings, and literal
 tool/reasoning marker text.
 
-Automatic structured tool turns use whole-turn guidance rather than region guidance, so a
+Non-native automatic structured tool turns use whole-turn guidance rather than region guidance, so a
 marker mentioned in scratchpad text cannot prematurely activate argument decoding.
 Whole-turn guidance disables speculative drafts; qualify its performance as well
 as correctness with the intended model. Region-only masks cannot enforce the
@@ -354,7 +436,7 @@ background coding-agent compaction. The capacity watchdog bounds stalled capacit
 not total queue time; queued requests remain cancelable and do not expire merely
 because another healthy local generation lasts more than 30 seconds.
 
-An invalid uncommitted call gets at most one guided retry with a bounded schema
+An invalid uncommitted call gets at most one retry with a bounded schema
 diagnostic and the remaining output-token budget. Already streamed text/reasoning
 retains its exact token prefix and is not published twice. No retry is allowed
 after a tool call was published, cancellation, truncation, stop-sequence
@@ -362,11 +444,38 @@ interruption, or incompatible explicit/raw guidance. Rejected and interrupted
 argument payloads never become assistant text. Exhaustion is an explicit error,
 not an empty successful response.
 
+Native recovery does not enable guidance. A private retry
+opens a mandatory native tagged-JSON scope using the published tool-opening token.
+Only that trusted scope may finish at a backend-confirmed natural end without a
+generated tool-closing marker; the complete JSON batch must satisfy the original
+schemas, selected tool names, and call count. Ordinary output still requires
+token-owned tool boundaries. Required native turns that omit a tool call can
+retain their entire exact output prefix before this single corrective attempt.
+Private native correction uses Qwen's existing `name`/`arguments` envelope;
+envelopes containing extra members remain invalid. Neither malformed JSON nor
+argument values are repaired or coerced.
+
 Recovery also shares implicit classic Generator output limits; it cannot acquire a
 fresh default allowance or use the retained conversation's full context as an output
 budget. Engine text turns remain uncapped when the caller leaves their limit unset.
 
-Qualification requires both protocol fidelity and the **real Copilot CLI** coding
+General-chat function qualification is separate from coding-agent qualification. With a locally registered model
+already loaded, select the ordinary chat cases explicitly:
+
+```bash
+python sdk_v2/cpp/test/manual/tool_call_gate.py \
+  --endpoint http://127.0.0.1:5273/catalogs/local/v1 --model YOUR_MODEL_ID \
+  --case chat_function_round_trip --case chat_tool_error --case chat_typed_arguments \
+  --case plain_answer_auto --case responses_chat_function_round_trip \
+  --output-dir sdk_v2/cpp/build/chat-function-gate
+```
+
+These cases preserve the caller's tool set and automatic selection, correlate real call IDs with results, and check
+the final answer. Chat Completions runs both streaming modes; the Responses round trip is nonstreaming.
+Also verify retained typed SDK sessions and fresh processes with the intended runtime packages. Passing these
+cases does not certify every schema/control combination, a released package, or coding-agent behavior.
+
+Coding-agent qualification requires both protocol fidelity and the **real Copilot CLI** coding
 workflow, not just an offline harness self-test. With the server already running:
 
 ```powershell

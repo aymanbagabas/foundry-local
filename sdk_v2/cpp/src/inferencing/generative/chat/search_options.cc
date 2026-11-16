@@ -105,11 +105,12 @@ RequestBudget ComputeRequestBudget(int64_t prompt_tokens,
 int ValidateGeneratorRequestBudget(int64_t prompt_tokens, int max_output_tokens, int context_limit_tokens) {
   const auto budget = ComputeRequestBudget(prompt_tokens, max_output_tokens, context_limit_tokens);
   if (!budget.fits) {
-    FL_THROW(FOUNDRY_LOCAL_ERROR_INVALID_ARGUMENT,
-             "request requires " + std::to_string(budget.required_tokens) + " total tokens (" +
-                 std::to_string(prompt_tokens) + " input + " + std::to_string(max_output_tokens) +
-                 " output), which exceeds the model's maximum context length of " +
-                 std::to_string(context_limit_tokens) + " tokens");
+    throw ContextLengthException(
+        FL_WHERE_WITH_STACK,
+        "request requires " + std::to_string(budget.required_tokens) + " total tokens (" +
+            std::to_string(prompt_tokens) + " input + " + std::to_string(max_output_tokens) +
+            " output), which exceeds the model's maximum context length of " +
+            std::to_string(context_limit_tokens) + " tokens");
   }
 
   return static_cast<int>(budget.required_tokens);
@@ -322,12 +323,9 @@ int ApplySearchOptions(const SearchOptions& options,
     gen_params.SetSearchOption("random_seed", static_cast<double>(*options.seed));
   }
 
-  // Preserve the established Generator default of sampling when the caller supplies no sampling policy.
-  if (sampling.do_sample.has_value()) {
-    gen_params.SetSearchOptionBool("do_sample", *sampling.do_sample);
-  } else {
-    gen_params.SetSearchOptionBool("do_sample", true);
-  }
+  // Honor explicit model defaults; absent metadata retains Foundry's established sampling default.
+  const bool model_do_sample = config.search ? config.search->do_sample.value_or(true) : true;
+  gen_params.SetSearchOptionBool("do_sample", sampling.do_sample.value_or(model_do_sample));
 
   // Early stopping is a beam-search policy, independent from decoded stop strings.
   if (options.early_stopping.value_or(false)) {

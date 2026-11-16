@@ -2,10 +2,12 @@
 // Licensed under the MIT License.
 #include "download/download_manager.h"
 #include "http/model_http_transport.h"
+#include "catalog/non_generative_package.h"
 #include "platform/cross_process_file_lock.h"
 #include "download/inference_model_writer.h"
 #include "exception.h"
 #include "inferencing/model_load_manager.h"
+#include "inferencing/generative/genai_config.h"
 #include "log_level.h"
 #include "logger.h"
 #include "telemetry/download_tracker.h"
@@ -264,6 +266,7 @@ DownloadManager::DownloadManager(std::string cache_directory, std::string_view c
                                  ILogger& logger, ITelemetry& telemetry, bool disable_region_fallback,
                                  std::unique_ptr<ModelRegistryClient> registry_client,
                                  std::unique_ptr<IBlobDownloader> blob_downloader,
+                                 std::function<ModelContainer(const ModelInfo&)> artifact_resolver,
                                  std::shared_ptr<http::ModelHttpTransport> model_http_transport)
     : cache_directory_(std::move(cache_directory)),
       config_region_(NormalizeConfiguredRegion(catalog_region)),
@@ -275,6 +278,7 @@ DownloadManager::DownloadManager(std::string cache_directory, std::string_view c
                                              std::make_unique<RegionFallback>(logger, !disable_region_fallback),
                                              HttpGetResponseFn{}, model_http_transport)),
       blob_downloader_(blob_downloader ? std::move(blob_downloader) : std::make_unique<AzureBlobDownloader>(logger, model_http_transport ? model_http_transport->AzureTransport() : nullptr)),
+      artifact_resolver_(std::move(artifact_resolver)),
       telemetry_(telemetry) {}
 
 DownloadManager::~DownloadManager() = default;
@@ -357,8 +361,7 @@ std::string DownloadManager::DownloadModel(const ModelInfo& info,
   // A valid cache hit requires: directory exists, no in-progress signal file, and
   // inference_model.json is present (written by DownloadModel on successful completion).
   auto signal_path = std::filesystem::path(model_path) / kDownloadSignalFileName;
-  if (std::filesystem::exists(model_path) && !std::filesystem::exists(signal_path) &&
-      HasInferenceModelJson(model_path)) {
+  if (IsCompletedModelPath(model_path)) {
     // Already cached and download was complete — cancellation request is
     // meaningless at 100%, so the return value is intentionally ignored.
     if (progress_cb) {
@@ -438,8 +441,7 @@ std::string DownloadManager::DownloadModel(const ModelInfo& info,
 
   // Another process may have just completed the download we were waiting on.
   // Re-check the cache now that we hold the lock.
-  if (std::filesystem::exists(model_path) && !std::filesystem::exists(signal_path) &&
-      HasInferenceModelJson(model_path)) {
+  if (IsCompletedModelPath(model_path)) {
     if (progress_cb) {
       progress_cb(100.0f);
     }
@@ -464,7 +466,7 @@ std::string DownloadManager::DownloadModel(const ModelInfo& info,
 
     // Step 1: Resolve SAS URI from the region that served this model's catalog entry
     // (or the explicit override / default registry-region fallback).
-    auto container = registry_client_->ResolveModelContainer(info.uri, ResolveRegion(config_region_, info));
+    auto container = artifact_resolver_ ? artifact_resolver_(info) : registry_client_->ResolveModelContainer(info.uri, ResolveRegion(config_region_, info));
 
     if (container.blob_sas_uri.empty()) {
       FL_THROW(FOUNDRY_LOCAL_ERROR_INTERNAL, "model registry returned empty SAS URI for: " + info.uri);
@@ -472,9 +474,7 @@ std::string DownloadManager::DownloadModel(const ModelInfo& info,
 
     // Step 2: Download blobs
     BlobDownloadOptions download_opts;
-    // The ModelInfo doesn't currently carry a path prefix, but the URI is the asset_id
-    // and the blob container has all files at the root or in variant subdirectories.
-    download_opts.path_prefix = "";
+    download_opts.path_prefix = container.path_prefix;
     download_opts.max_concurrency = max_concurrency_;
 
     if (progress_cb) {
@@ -483,8 +483,38 @@ std::string DownloadManager::DownloadModel(const ModelInfo& info,
       };
     }
 
-    DownloadBlobsToDirectory(*blob_downloader_, container.blob_sas_uri,
-                             model_path, download_opts, stats, logger_);
+    try {
+      DownloadBlobsToDirectory(*blob_downloader_, container.blob_sas_uri,
+                               model_path, download_opts, stats, logger_);
+    } catch (const Exception& error) {
+      if (!artifact_resolver_ || error.code() != FOUNDRY_LOCAL_ERROR_NETWORK) throw;
+      logger_.Log(LogLevel::Information, "Refreshing test-model artifact access and resuming download.");
+      container = artifact_resolver_(info);
+      download_opts.path_prefix = container.path_prefix;
+      DownloadBlobsToDirectory(*blob_downloader_, container.blob_sas_uri,
+                               model_path, download_opts, stats, logger_);
+    }
+
+    if (artifact_resolver_) {
+      if (stats.file_count == 0) {
+        FL_THROW(FOUNDRY_LOCAL_ERROR_INVALID_ARGUMENT, "test model package contains no files: " + info.model_id);
+      }
+      const auto config_path = std::filesystem::path(model_path) / kGenAIConfigFileName;
+      if (info.task == "text-ranking" || info.task == "typed-decision") {
+        const auto package = ReadNonGenerativePackage(model_path, /*allow_in_progress=*/true);
+        if (!package || (!package->task.empty() && package->task != info.task)) {
+          FL_THROW(FOUNDRY_LOCAL_ERROR_INVALID_ARGUMENT, "model package does not match task: ", info.task);
+        }
+      } else if (info.task == "chat-completion" || info.task == "coding" ||
+                 info.task == "vision-language-chat" || info.task == "automatic-speech-recognition" ||
+                 info.task == "embeddings") {
+        if (!GenAIConfig::LoadFromFile(config_path.string()).model) {
+          FL_THROW(FOUNDRY_LOCAL_ERROR_INVALID_ARGUMENT, "test model package has no GenAI model configuration");
+        }
+      } else {
+        FL_THROW(FOUNDRY_LOCAL_ERROR_NOT_IMPLEMENTED, "unsupported model package task: ", info.task);
+      }
+    }
 
     record_stats(stats);
     tracker.SetDownloadWaitResult("Completed");
@@ -511,16 +541,15 @@ std::string DownloadManager::DownloadModel(const ModelInfo& info,
 }
 
 bool DownloadManager::IsModelCached(const ModelInfo& info) const {
-  auto model_path = ComputeModelPath(info);
-  if (!std::filesystem::exists(model_path)) {
-    return false;
-  }
+  return IsCompletedModelPath(ComputeModelPath(info));
+}
 
-  // A valid cache requires no in-progress signal file AND inference_model.json
-  // (written on successful download completion). An empty directory or one
-  // without inference_model.json is not a valid cache hit.
-  auto signal_path = std::filesystem::path(model_path) / kDownloadSignalFileName;
-  return !std::filesystem::exists(signal_path) && HasInferenceModelJson(model_path);
+bool DownloadManager::IsCompletedModelPath(const std::string& path) {
+  const auto root = std::filesystem::path(path);
+  return !path.empty() && std::filesystem::is_directory(root) &&
+         !std::filesystem::exists(root / kDownloadSignalFileName) &&
+         !std::filesystem::exists(root.parent_path() / kDownloadSignalFileName) &&
+         HasInferenceModelJson(path);
 }
 
 std::string DownloadManager::GetModelCachePath(const ModelInfo& info) const {

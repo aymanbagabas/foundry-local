@@ -47,4 +47,11 @@ class TimeoutException : public Exception {
   using Exception::Exception;
 };
 
+/// Internal context-budget distinction; original requests remain invalid arguments.
+class ContextLengthException : public Exception {
+ public:
+  ContextLengthException(const CodeLocation& location, const std::string& message)
+      : Exception(location, message, FOUNDRY_LOCAL_ERROR_INVALID_ARGUMENT) {}
+};
+
 }  // namespace fl

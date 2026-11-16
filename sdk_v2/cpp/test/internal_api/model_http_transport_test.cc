@@ -4,12 +4,13 @@
 
 #include "c_api_types.h"
 #include "catalog/azure_catalog_client.h"
+#include "catalog/azure_registry_catalog.h"
 #include "configuration.h"
 #include "download/blob_downloader.h"
 #include "download/download_manager.h"
 #include "exception.h"
 #include "telemetry/telemetry_logger.h"
-#include "test_helpers.h"
+#include "internal_api/test_helpers.h"
 
 #if FOUNDRY_LOCAL_HAS_SHARED_HOST
 #include "hosting/host_profile.h"
@@ -275,23 +276,24 @@ class CpuDetector final : public IEpDetector {
   }
 };
 
-TEST(ModelHttpTransportTest, VersionFourAddsSetterWithoutChangingOlderNegotiation) {
-  EXPECT_EQ(FOUNDRY_LOCAL_API_VERSION, 4);
+TEST(ModelHttpTransportTest, VersionFiveAddsSetterWithoutChangingOlderNegotiation) {
+  EXPECT_EQ(FOUNDRY_LOCAL_API_VERSION, 5);
   const auto* old = FoundryLocalGetApi(3);
-  const auto* current = FoundryLocalGetApi(4);
+  const auto* current = FoundryLocalGetApi(5);
   ASSERT_NE(current, nullptr);
   EXPECT_EQ(FoundryLocalGetApi(0), old);
   EXPECT_EQ(FoundryLocalGetApi(1), old);
   EXPECT_EQ(FoundryLocalGetApi(2), old);
+  EXPECT_EQ(FoundryLocalGetApi(4), old);
   EXPECT_EQ(old->GetConfigurationApi()->SetModelHttpTransport, nullptr);
   EXPECT_NE(current->GetConfigurationApi()->SetModelHttpTransport, nullptr);
   EXPECT_EQ(current->Manager_Create, old->Manager_Create);
-  EXPECT_EQ(FoundryLocalGetApi(5), nullptr);
+  EXPECT_EQ(FoundryLocalGetApi(6), nullptr);
   EXPECT_EQ(offsetof(flConfigurationApi, SetModelHttpTransport), 12 * sizeof(void*));
 }
 
 TEST(ModelHttpTransportTest, SetterCopiesTableAndSnapshotsRetainOldContextAfterReplacementAndClear) {
-  const auto& api = *FoundryLocalGetApi(4);
+  const auto& api = *FoundryLocalGetApi(5);
   const auto& configuration = *api.GetConfigurationApi();
   flConfiguration* config = nullptr;
   ASSERT_EQ(configuration.Create("transport-test", &config), nullptr);
@@ -315,7 +317,7 @@ TEST(ModelHttpTransportTest, SetterCopiesTableAndSnapshotsRetainOldContextAfterR
 }
 
 TEST(ModelHttpTransportTest, InvalidSetterLeavesExistingTransportUnchanged) {
-  const auto& api = *FoundryLocalGetApi(4);
+  const auto& api = *FoundryLocalGetApi(5);
   const auto& configuration = *api.GetConfigurationApi();
   flConfiguration* config = nullptr;
   ASSERT_EQ(configuration.Create("transport-test", &config), nullptr);
@@ -664,13 +666,34 @@ TEST(ModelHttpTransportTest, CatalogRetryPolicyRecreatesCustomOperationsWithoutB
   EXPECT_EQ(fake.operations_released, 2);
 }
 
+TEST(ModelHttpTransportTest, AzureRegistryCatalogRejectsCustomTransportBeforeCredentialsOrRequests) {
+  FakeTransport fake;
+  test::FakeServiceBindings services;
+  const auto directory = test::TempPath::CreateTempDir("foundry-registry-custom-transport-");
+  Configuration config;
+  config.model_cache_dir = directory.string();
+  config.model_http_transport = fake.Make();
+  try {
+    AzureRegistryCatalog catalog("mock-registry", config, services.ep_detector, services.model_load_manager,
+                                 services.logger, services.telemetry, nullptr, "invalid-credential-mode");
+    FAIL() << "Azure Registry catalog must not bypass the custom acquisition transport";
+  } catch (const Exception& error) {
+    EXPECT_EQ(error.code(), FOUNDRY_LOCAL_ERROR_NOT_IMPLEMENTED);
+    EXPECT_NE(std::string(error.what()).find("Azure Registry catalogs do not yet support custom model HTTP transports"),
+              std::string::npos);
+  }
+
+  EXPECT_EQ(fake.created, 0);
+  EXPECT_EQ(fake.sent, 0);
+}
+
 TEST(ModelHttpTransportTest, DownloadManagerRoutesRegistryAndBlobListingHeadAndRangeThroughCustomTransport) {
   FakeTransport fake;
   fake.acquisition = true;
   const auto directory = test::TempPath::CreateTempDir("foundry-custom-transport-");
   TelemetryLogger telemetry("custom-transport-test", test::NullLog());
   DownloadManager manager(directory.string(), "centralus", 1, test::NullLog(), telemetry, true,
-                          nullptr, nullptr, fake.Make());
+                          nullptr, nullptr, nullptr, fake.Make());
   ModelInfo info;
   info.model_id = "transport-model:1";
   info.name = "transport-model";

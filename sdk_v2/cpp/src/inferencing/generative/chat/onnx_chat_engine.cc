@@ -17,6 +17,14 @@ namespace fl {
 
 namespace {
 
+template <typename Capabilities>
+std::optional<bool> ReadGuidanceSupport(const Capabilities& capabilities) {
+  if constexpr (requires { capabilities.SupportsGuidance(); }) {
+    return capabilities.SupportsGuidance();
+  }
+  return std::nullopt;
+}
+
 // Only options the caller expressed are set. Upstream treats an unset turn option as "use the model-configured
 // default for this Turn", so forwarding a Foundry-invented default would silently override model policy — and an
 // explicit do_sample=true is rejected outright when the model's own defaults still resolve the turn to greedy.
@@ -184,12 +192,13 @@ uint64_t OnnxChatEngine::BeginTurn(const std::shared_ptr<Conversation>& conversa
               static_cast<uint64_t>(existing_tokens) + static_cast<uint64_t>(tokens.size()) +
               static_cast<uint64_t>(*plan.max_generated_tokens);
           if (total_required > max_request_length_) {
-            FL_THROW(FOUNDRY_LOCAL_ERROR_INVALID_ARGUMENT,
-                     "request requires " + std::to_string(total_required) + " total tokens (" +
-                         std::to_string(existing_tokens) + " existing + " + std::to_string(tokens.size()) +
-                         " input + " + std::to_string(*plan.max_generated_tokens) +
-                         " output), which exceeds the Engine's maximum request length of " +
-                         std::to_string(max_request_length_) + " tokens");
+            throw ContextLengthException(
+                FL_WHERE_WITH_STACK,
+                "request requires " + std::to_string(total_required) + " total tokens (" +
+                    std::to_string(existing_tokens) + " existing + " + std::to_string(tokens.size()) +
+                    " input + " + std::to_string(*plan.max_generated_tokens) +
+                    " output), which exceeds the Engine's maximum request length of " +
+                    std::to_string(max_request_length_) + " tokens");
           }
         }
 
@@ -339,6 +348,13 @@ void OnnxChatEngine::WorkerLoop(std::promise<void> initialized) {
     engine_ = OgaEngine::Create(model_.GetOgaModel());
     auto capabilities = engine_->GetCapabilities();
     max_request_length_ = capabilities->MaxRequestLength();
+    supports_guidance_ = ReadGuidanceSupport(*capabilities);
+    if (!supports_guidance_) {
+      model_.GetLogger().Log(
+          LogLevel::Warning,
+          "The loaded GenAI package does not expose guidance capability; native-schema fallback "
+          "requiring guidance will be rejected. Update the runtime to enable capability-based fallback.");
+    }
     if (max_request_length_ == 0) {
       throw std::runtime_error("Dynamic Engine did not report max_request_length.");
     }

@@ -86,6 +86,8 @@ struct flManager {
   fl::api::ManagerBackend& impl;
   mutable flCatalog public_catalog;
   mutable flCatalog local_catalog;
+  mutable std::mutex catalogs_mutex;
+  mutable std::map<fl::api::CatalogBackend*, std::unique_ptr<flCatalog>> azure_registry_catalogs;
   mutable std::mutex urls_mutex;
   mutable std::map<std::vector<std::string>, std::vector<const char*>> url_snapshots;
 };
@@ -356,10 +358,10 @@ static const flConfigurationApi g_configuration_api = {
     SetExternalServiceUrlImpl,
     SetAdditionalOptionsImpl,
     SetUseSharedHostImpl,
-    nullptr,  // The pre-v4 negotiation path must not expose the new setter.
+    nullptr,  // The pre-v5 negotiation path must not expose the new setter.
 };
 
-static const flConfigurationApi g_configuration_api_v4 = [] {
+static const flConfigurationApi g_configuration_api_v5 = [] {
   auto api = g_configuration_api;
   api.SetModelHttpTransport = SetModelHttpTransportImpl;
   return api;
@@ -370,7 +372,7 @@ static_assert(offsetof(flConfigurationApi, SetAdditionalOptions) / sizeof(void*)
 static_assert(offsetof(flConfigurationApi, SetUseSharedHost) / sizeof(void*) == 11,
               "Size of version 3 Configuration API cannot change");
 static_assert(offsetof(flConfigurationApi, SetModelHttpTransport) / sizeof(void*) == 12,
-              "Version 4 Configuration API must append after the version 3 prefix");
+              "Version 5 Configuration API must append after the version 3 prefix");
 
 // ========================================================================
 // Manager API
@@ -411,6 +413,26 @@ FL_API_STATUS_IMPL(Manager_GetCatalogImpl, const flManager* manager, flCatalog**
   API_IMPL_END
 }
 
+FL_API_STATUS_IMPL(Manager_GetCatalogWithOptionsImpl, const flManager* manager, flCatalogType catalog_type,
+                   const flKeyValuePairs* options, flCatalog** out_catalog) {
+  API_IMPL_BEGIN
+  if (!manager || !out_catalog) {
+    return MakeStatus(FOUNDRY_LOCAL_ERROR_INVALID_ARGUMENT, "null argument");
+  }
+  const fl::KeyValuePairs empty;
+  auto& source = manager->impl.GetCatalog(static_cast<fl::CatalogType>(catalog_type), options ? *AsImpl(options) : empty);
+  if (catalog_type == FOUNDRY_LOCAL_CATALOG_PUBLIC || catalog_type == FOUNDRY_LOCAL_CATALOG_LOCAL) {
+    *out_catalog = catalog_type == FOUNDRY_LOCAL_CATALOG_PUBLIC ? &manager->public_catalog : &manager->local_catalog;
+    return nullptr;
+  }
+  std::lock_guard lock(manager->catalogs_mutex);
+  auto& catalog = manager->azure_registry_catalogs[&source];
+  if (!catalog) catalog = std::make_unique<flCatalog>(flCatalog{source});
+  *out_catalog = catalog.get();
+  return nullptr;
+  API_IMPL_END
+}
+
 FL_API_STATUS_IMPL(Manager_GetCatalogByTypeImpl, const flManager* manager, flCatalogType catalog_type,
                    flCatalog** out_catalog) {
   API_IMPL_BEGIN
@@ -425,6 +447,8 @@ FL_API_STATUS_IMPL(Manager_GetCatalogByTypeImpl, const flManager* manager, flCat
     case FOUNDRY_LOCAL_CATALOG_LOCAL:
       *out_catalog = &manager->local_catalog;
       return nullptr;
+    case FOUNDRY_LOCAL_CATALOG_AZURE_REGISTRY:
+      return Manager_GetCatalogWithOptionsImpl(manager, catalog_type, nullptr, out_catalog);
     default:
       return MakeStatus(FOUNDRY_LOCAL_ERROR_INVALID_ARGUMENT, "unknown catalog type");
   }
@@ -2049,8 +2073,8 @@ static const flConfigurationApi* FL_API_CALL GetConfigurationApiImpl() FL_NO_EXC
   return &g_configuration_api;
 }
 
-static const flConfigurationApi* FL_API_CALL GetConfigurationApiV4Impl() FL_NO_EXCEPTION {
-  return &g_configuration_api_v4;
+static const flConfigurationApi* FL_API_CALL GetConfigurationApiV5Impl() FL_NO_EXCEPTION {
+  return &g_configuration_api_v5;
 }
 
 static const flItemApi* FL_API_CALL GetItemApiImpl() FL_NO_EXCEPTION {
@@ -2096,16 +2120,19 @@ static const flApi g_api = {
     Manager_ShutdownImpl,
     Manager_IsShutdownRequestedImpl,
     Manager_GetCatalogByTypeImpl,
+    Manager_GetCatalogWithOptionsImpl,
 };
 
 static_assert(offsetof(flApi, Manager_IsShutdownRequested) / sizeof(void*) == 28,
               "Size of version 1 API cannot change");
 static_assert(offsetof(flApi, Manager_GetCatalogByType) / sizeof(void*) == 29,
               "Size of version 2 API cannot change");
+static_assert(offsetof(flApi, Manager_GetCatalogWithOptions) / sizeof(void*) == 30,
+              "Size of version 4 API cannot change");
 
-static const flApi g_api_v4 = [] {
+static const flApi g_api_v5 = [] {
   auto api = g_api;
-  api.GetConfigurationApi = GetConfigurationApiV4Impl;
+  api.GetConfigurationApi = GetConfigurationApiV5Impl;
   return api;
 }();
 
@@ -2116,12 +2143,12 @@ static const flApi g_api_v4 = [] {
 extern "C" {
 
 FL_EXPORT const flApi* FL_API_CALL FoundryLocalGetApi(uint32_t version) FL_NO_EXCEPTION {
-  if (version < 4) {
+  if (version < 5) {
     return &g_api;
   }
 
   if (version == FOUNDRY_LOCAL_API_VERSION) {
-    return &g_api_v4;
+    return &g_api_v5;
   }
 
   return nullptr;

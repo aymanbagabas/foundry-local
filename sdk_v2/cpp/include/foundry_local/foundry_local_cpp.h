@@ -17,6 +17,12 @@
 #error "foundry_local_cpp.h requires C++17 or later."
 #endif
 
+#ifdef GetMessage
+// Win32 maps GetMessage to GetMessageA/GetMessageW. The Foundry C++ API owns
+// this name and must remain independent of the consumer's Windows include order.
+#undef GetMessage
+#endif
+
 #include "foundry_local/foundry_local_c.h"
 
 #include <cassert>
@@ -25,6 +31,8 @@
 #include <cstdlib>
 #include <functional>
 #include <memory>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -59,12 +67,11 @@ inline const char* Version() noexcept;
 namespace detail {
 
 inline uint32_t api_version() {
-  static const uint32_t version = []() {
-    if (FoundryLocalGetApi(FOUNDRY_LOCAL_API_VERSION)) {
-      return uint32_t{FOUNDRY_LOCAL_API_VERSION};
+  static const uint32_t version = [] {
+    for (uint32_t candidate = FOUNDRY_LOCAL_API_VERSION; candidate >= 2; --candidate) {
+      if (FoundryLocalGetApi(candidate)) return candidate;
     }
-
-    return FoundryLocalGetApi(3) ? uint32_t{3} : uint32_t{2};
+    throw std::runtime_error("Foundry Local runtime does not support API versions 5, 4, 3 or 2");
   }();
   return version;
 }
@@ -284,7 +291,7 @@ class Configuration {
   /// Requires an API v3 runtime when enabled. Cannot be combined with SetExternalServiceUrl.
   Configuration& SetUseSharedHost(bool enabled);
 
-  /// Optional. Override model HTTP transport; nullptr restores the default. Requires an API v4 runtime.
+  /// Optional. Override model HTTP transport; nullptr restores the default. Requires an API v5 runtime.
   /// Copies the validated table and retains its context; already-created managers keep their transport snapshot.
   /// See flHttpTransport for callback, cancellation, timeout, and request/response lifetime requirements.
   Configuration& SetModelHttpTransport(const flHttpTransport* transport);
@@ -900,6 +907,8 @@ class Manager {
 
   /// Get a manager-owned catalog for querying models.
   ICatalog& GetCatalog(flCatalogType type = FOUNDRY_LOCAL_CATALOG_PUBLIC) const;
+  /// Azure Registry accepts "name" (required) and "credential" (azure_cli or workload_identity).
+  ICatalog& GetCatalog(flCatalogType type, const KeyValuePairs& options) const;
 
   /// Start the embedded web service.
   void StartWebService();
@@ -937,6 +946,11 @@ class Manager {
 
     mutable Catalog public_;
     mutable Catalog local_;
+    struct Configured {
+      std::mutex mutex;
+      std::map<flCatalog*, std::unique_ptr<Catalog>> catalogs;
+    };
+    std::shared_ptr<Configured> configured_ = std::make_shared<Configured>();
   };
 
   detail::Base<flManager> handle_;
@@ -1194,6 +1208,20 @@ class EmbeddingsSession : public Session {
 
   /// Convenience helper: generate L2-normalized embedding vectors for a batch of inputs.
   std::vector<std::vector<float>> Embed(const std::vector<std::string>& inputs);
+};
+
+/// Typed-decision and ranking sessions use the same JSON contracts as the
+/// corresponding Foundry Local HTTP endpoints.
+class RankingSession : public Session {
+ public:
+  explicit RankingSession(IModel& model);
+  std::string RankJson(const std::string& request_json);
+};
+
+class DecisionSession : public Session {
+ public:
+  explicit DecisionSession(IModel& model);
+  std::string DecideJson(const std::string& request_json);
 };
 
 // ===========================================================================

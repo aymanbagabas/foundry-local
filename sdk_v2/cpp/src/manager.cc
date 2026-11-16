@@ -15,6 +15,7 @@
 #include "catalog.h"
 #include "catalog/azure_model_catalog.h"
 #include "catalog/local_model_catalog.h"
+#include "catalog/azure_registry_catalog.h"
 #include "download/download_manager.h"
 #if FOUNDRY_LOCAL_HAS_EP_BOOTSTRAPPERS
 #include "ep_detection/cuda_ep_bootstrapper.h"
@@ -365,12 +366,19 @@ Manager::Manager(const Configuration& config) : config_(config) {
     bootstrappers.push_back(std::make_unique<CudaEpBootstrapper>(cuda_ep_root.string(), register_ep));
   }
 
+#if defined(__APPLE__)
+#if defined(__aarch64__)
+  // macOS uses ORT's built-in WebGPU provider, never the separately downloaded plugin.
+  bootstrappers.push_back(std::make_unique<BuiltInWebGpuEpBootstrapper>(*ort_api_, *ort_env_, *logger_));
+#endif
+#else
   // Avoid downloading WebGPU when ORT's pre-registration hardware inventory has no GPU.
   if (WebGpuEpBootstrapper::IsSupportedPlatform() &&
       Utils::HasGpuHardwareDevice(*ort_api_, *ort_env_, *logger_)) {
     const auto webgpu_ep_root = std::filesystem::path(*config_.app_data_dir) / "ep" / "webgpu-ep";
     bootstrappers.push_back(std::make_unique<WebGpuEpBootstrapper>(webgpu_ep_root.string(), register_ep));
   }
+#endif
 #endif
 
   const bool disable_nonessential_telemetry =
@@ -424,7 +432,7 @@ Manager::Manager(const Configuration& config) : config_(config) {
   download_manager_ =
       std::make_unique<DownloadManager>(*config_.model_cache_dir, config_.catalog_region.value_or("auto"),
                                         download_concurrency, *logger_, *telemetry_, disable_region_fallback,
-                                        nullptr, nullptr, config_.model_http_transport);
+                                        nullptr, nullptr, nullptr, config_.model_http_transport);
   model_load_manager_ = std::make_unique<ModelLoadManager>(
       *ep_detector_, *logger_, non_generative_memory_budget_bytes,
       static_cast<size_t>(non_generative_readiness_concurrency));
@@ -465,10 +473,15 @@ Manager::~Manager() {
   web_service_.reset();
 #endif
   session_manager_.reset();
+  if (model_load_manager_) {
+    model_load_manager_->WaitForPredictiveRequests();
+    model_load_manager_->ReleasePredictiveSessions();
+  }
   model_load_manager_.reset();
   download_manager_.reset();
   local_catalog_.reset();
   public_catalog_.reset();
+  azure_registry_catalogs_.clear();
   telemetry_.reset();
 
   for (auto it = oga_registered_ep_libraries_.rbegin();
@@ -584,9 +597,40 @@ ICatalog& Manager::GetCatalog(CatalogType type) {
       return *public_catalog_;
     case CatalogType::kLocal:
       return *local_catalog_;
+    case CatalogType::kAzureRegistry:
+      FL_THROW(FOUNDRY_LOCAL_ERROR_INVALID_ARGUMENT,
+               "Azure Registry catalog requires option 'name'; call GetCatalog(type, options)");
     default:
       FL_THROW(FOUNDRY_LOCAL_ERROR_INVALID_ARGUMENT, "unknown catalog type");
   }
+}
+
+ICatalog& Manager::GetCatalog(CatalogType type, const KeyValuePairs& options) {
+  if (type != CatalogType::kAzureRegistry) {
+    if (!options.empty()) FL_THROW(FOUNDRY_LOCAL_ERROR_INVALID_ARGUMENT, "this catalog does not accept options");
+    return GetCatalog(type);
+  }
+  const auto settings = AzureRegistryCatalog::NormalizeOptions(options);
+  std::lock_guard lock(azure_registry_catalogs_mutex_);
+  auto& catalog = azure_registry_catalogs_[settings.Entries()];
+  if (!catalog) {
+    catalog = std::make_unique<AzureRegistryCatalog>(settings.Find("name"), config_, *ep_detector_, *model_load_manager_,
+                                                     *logger_, *telemetry_, nullptr, settings.Find("credential"),
+                                                     IsAdditionalOptionEnabled(config_, "AzureRegistryModelCacheOnly"));
+    if (catalog_runtime_devices_) {
+      static_cast<RemoteModelCatalog&>(*catalog).SetRuntimeDevices(*catalog_runtime_devices_);
+    }
+  }
+  return *catalog;
+}
+
+void Manager::SetCatalogRuntimeDevices(std::map<std::string, std::vector<std::string>> devices) {
+  std::lock_guard lock(azure_registry_catalogs_mutex_);
+  static_cast<RemoteModelCatalog&>(*public_catalog_).SetRuntimeDevices(devices);
+  for (auto& [registry, catalog] : azure_registry_catalogs_) {
+    static_cast<RemoteModelCatalog&>(*catalog).SetRuntimeDevices(devices);
+  }
+  catalog_runtime_devices_ = std::move(devices);
 }
 
 void Manager::StartWebService() {
@@ -602,10 +646,7 @@ void Manager::StartWebService() {
   ActionTracker tracker(Action::kCoreServiceStart, *telemetry_);
 
 #ifdef FOUNDRY_LOCAL_HAS_WEB_SERVICE
-  web_service_ = std::make_unique<WebService>(*public_catalog_, *local_catalog_, *logger_, *config_.model_cache_dir,
-                                              *model_load_manager_,
-                                              *session_manager_, *telemetry_,
-                                              [this]() { RequestShutdown(); }, shared_host_lifetime_);
+  web_service_ = std::make_unique<WebService>(*public_catalog_, *local_catalog_, *logger_, *config_.model_cache_dir, *model_load_manager_, *session_manager_, *telemetry_, [this]() { RequestShutdown(); }, shared_host_lifetime_);
 
   auto endpoints = config_.web_service_endpoints;
   if (endpoints.empty()) {
@@ -638,7 +679,7 @@ void Manager::SetSharedHostLifetime(std::shared_ptr<hosting::HostLifetime> lifet
   if (!lifetime || web_service_running_ ||
       (shared_host_lifetime_ && shared_host_lifetime_ != lifetime)) {
     FL_LOG_AND_THROW(*logger_, FOUNDRY_LOCAL_ERROR_INVALID_USAGE,
-                    "shared-host HTTP admission must be configured once before starting the web service");
+                     "shared-host HTTP admission must be configured once before starting the web service");
   }
 
   shared_host_lifetime_ = std::move(lifetime);
@@ -755,6 +796,8 @@ EpDownloadResult Manager::DownloadAndRegisterEps(const std::vector<std::string>*
   // another EP failed — so the next catalog query re-fetches with the updated filters.
   if (!result.registered_eps.empty()) {
     public_catalog_->InvalidateCache();
+    std::lock_guard lock(azure_registry_catalogs_mutex_);
+    for (auto& [registry, catalog] : azure_registry_catalogs_) catalog->InvalidateCache();
   }
 
   // Warn if any EPs failed to download or register, but keep going: CPU is always available and

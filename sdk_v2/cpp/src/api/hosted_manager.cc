@@ -32,6 +32,8 @@ const char* CatalogName(CatalogType catalog) {
       return "public";
     case CatalogType::kLocal:
       return "local";
+    case CatalogType::kAzureRegistry:
+      return "azure_registry";
   }
 
   FL_THROW(FOUNDRY_LOCAL_ERROR_INVALID_ARGUMENT, "unknown catalog type");
@@ -301,9 +303,19 @@ class HostedModel final : public ModelBackend {
   }
 
   std::unique_ptr<SessionBackend> CreateSession() const override {
-    const auto payload = Payload(true);
+    state_.RefreshCatalog(catalog_);
+    std::unique_ptr<LoadedSelectionReservation> reservation;
+    Json payload;
+    {
+      std::lock_guard lock(state_.selection_mutex);
+      const auto selected =
+          state_.metadata->CaptureModel(source_, &reservation);
+      payload = {{"model", EncodeModelSelection(catalog_, *selected)}};
+    }
     const auto context = state_.Connect(true);
-    const auto identity = DecodeObjectIdentity(context->Call(Operation::CreateSession, payload));
+    const auto identity = DecodeObjectIdentity(
+        context->Call(Operation::CreateSession, payload));
+    reservation->Commit();
     return CreateHostedSession(context, identity, state_.metadata);
   }
 
@@ -497,6 +509,9 @@ class HostedManager final : public ManagerBackend {
         return public_catalog_;
       case CatalogType::kLocal:
         return local_catalog_;
+      case CatalogType::kAzureRegistry:
+        FL_THROW(FOUNDRY_LOCAL_ERROR_INVALID_ARGUMENT,
+                 "Azure Registry catalog requires option 'name'");
     }
 
     FL_THROW(FOUNDRY_LOCAL_ERROR_INVALID_ARGUMENT, "unknown catalog type");
@@ -568,7 +583,8 @@ class HostedManager final : public ManagerBackend {
       }
     } else {
       for (const auto& ep : state_->metadata->GetDiscoverableEps()) {
-        values.push_back({ep.name, false});
+        // Built-in WebGPU is ready even before a host starts; plugin EPs are not.
+        values.push_back({ep.name, std::string_view(ep.name) == "WebGpuExecutionProvider" && ep.is_registered});
       }
     }
 

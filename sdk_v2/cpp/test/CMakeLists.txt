@@ -15,6 +15,10 @@ if(NOT CMAKE_CROSSCOMPILING AND NOT ANDROID AND NOT IOS)
     target_compile_options(cpp-api-v2-compatibility PRIVATE ${FOUNDRY_LOCAL_COMPILE_OPTIONS})
     set_target_properties(cpp-api-v2-compatibility PROPERTIES CXX_STANDARD 17)
     add_test(NAME cpp-api-v2-compatibility COMMAND cpp-api-v2-compatibility)
+    add_test(NAME cpp-api-v3-compatibility COMMAND cpp-api-v2-compatibility 3)
+    # API 4 has catalog options, but must reject the API 5 transport setter before reading its table tail.
+    add_test(NAME cpp-api-v4-compatibility COMMAND cpp-api-v2-compatibility 4)
+    add_test(NAME cpp-api-unsupported-compatibility COMMAND cpp-api-v2-compatibility 0)
 endif()
 
 if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
@@ -97,6 +101,7 @@ add_executable(foundry_local_tests
     internal_api/c_api_test.cc
     internal_api/callback_handler_test.cc
     internal_api/catalog_cache_test.cc
+    internal_api/azure_registry_catalog_test.cc
     internal_api/chat/chat_generator_test.cc
     internal_api/chat/reasoning_stream_splitter_test.cc
     internal_api/chat/chat_session_test.cc
@@ -194,6 +199,11 @@ if(FOUNDRY_LOCAL_HAS_EP_BOOTSTRAPPERS)
 endif()
 
 if(FOUNDRY_LOCAL_HAS_SHARED_HOST)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # The IPC regression unlinks the endpoint immediately after a successful connect.
+        target_link_options(foundry_local_tests PRIVATE "LINKER:--wrap=connect")
+    endif()
+
     target_sources(foundry_local_tests PRIVATE
         internal_api/host_server_test.cc
         internal_api/host_state_test.cc
@@ -313,18 +323,54 @@ if(WIN32)
         FOUNDRY_TEST_LOADER_LIBRARY="$<TARGET_FILE:loader-test-library>"
         FOUNDRY_TEST_LOADER_DEPENDENCY="$<TARGET_FILE:loader-test-dependency>")
     add_dependencies(windows-dynlib-loader-tests loader-test-library)
-    gtest_discover_tests(windows-dynlib-loader-tests DISCOVERY_MODE PRE_TEST)
+    gtest_discover_tests(windows-dynlib-loader-tests
+        DISCOVERY_MODE PRE_TEST
+        PROPERTIES RUN_SERIAL TRUE)
 endif()
+
+# Only these in-memory suites may overlap. Model, host, filesystem, and newly
+# added suites remain serial even when CI sets CTEST_PARALLEL_LEVEL.
+set(foundry_parallel_suites
+    RawEnvelopeDetectorTest
+    QwenXmlToolCallAccumulatorTest
+    ToolCallStreamAccumulatorTest
+    ReasoningStreamSplitterTest
+    PromptOpensReasoningTest
+    ResolveMarkerTokenIdsTest
+)
+list(TRANSFORM foundry_parallel_suites APPEND ".*")
+list(JOIN foundry_parallel_suites ":" foundry_parallel_filter)
 
 # DISCOVERY_TIMEOUT defaults to 5s, which is not enough for the Windows build:
 # foundry_local.dll links against Microsoft.Windows.AI.MachineLearning.dll
 # (delay-loaded) plus standalone ORT, and process startup + gtest enumeration
 # can exceed 5s on cold caches or slow CI agents. Bump to 60s for headroom.
-gtest_discover_tests(foundry_local_tests
-    WORKING_DIRECTORY $<TARGET_FILE_DIR:foundry_local_tests>
-    DISCOVERY_MODE PRE_TEST
-    DISCOVERY_TIMEOUT 60
-)
+if(CMAKE_VERSION VERSION_LESS 3.22)
+    # TEST_FILTER was added in 3.22. Keep one unfiltered, serial discovery on older CMake.
+    set(foundry_parallel_filter "")
+    gtest_discover_tests(foundry_local_tests
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:foundry_local_tests>
+        DISCOVERY_MODE PRE_TEST
+        DISCOVERY_TIMEOUT 60
+        PROPERTIES RUN_SERIAL TRUE
+    )
+else()
+    gtest_discover_tests(foundry_local_tests
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:foundry_local_tests>
+        DISCOVERY_MODE PRE_TEST
+        DISCOVERY_TIMEOUT 60
+        TEST_FILTER "${foundry_parallel_filter}"
+        TEST_LIST foundry_parallel_tests
+    )
+    gtest_discover_tests(foundry_local_tests
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:foundry_local_tests>
+        DISCOVERY_MODE PRE_TEST
+        DISCOVERY_TIMEOUT 60
+        TEST_FILTER "-${foundry_parallel_filter}"
+        TEST_LIST foundry_serial_tests
+        PROPERTIES RUN_SERIAL TRUE
+    )
+endif()
 
 add_test(
     NAME FoundryLocalVersionConfigureTwice
@@ -392,8 +438,23 @@ target_link_libraries(sdk_integration_tests
         ${FOUNDRY_LOCAL_HTTPLIB_LIBS}
 )
 
+add_executable(non_generative_sdk_tests
+    test_main.cc
+    sdk_api/non_generative_test.cc
+)
+set_target_properties(non_generative_sdk_tests PROPERTIES CXX_STANDARD 17)
+target_compile_options(non_generative_sdk_tests PRIVATE ${FOUNDRY_LOCAL_COMPILE_OPTIONS})
+target_include_directories(non_generative_sdk_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(non_generative_sdk_tests
+    PRIVATE
+        foundry_local_cpp
+        GTest::gtest
+        nlohmann_json::nlohmann_json
+)
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_options(sdk_integration_tests PRIVATE -Wl,--disable-new-dtags)
+    target_link_options(non_generative_sdk_tests PRIVATE -Wl,--disable-new-dtags)
 endif()
 
 # On Android the ORT/GenAI prebuilts statically link libc++ but export its symbols WEAK.
@@ -401,6 +462,7 @@ endif()
 # exported GLOBAL and interpose the prebuilts' weak copies.
 if(ANDROID)
     target_link_options(sdk_integration_tests PRIVATE -Wl,--exclude-libs,ALL)
+    target_link_options(non_generative_sdk_tests PRIVATE -Wl,--exclude-libs,ALL)
 endif()
 
 add_custom_command(TARGET sdk_integration_tests POST_BUILD
@@ -435,6 +497,14 @@ add_test(
 # The integration suite loads models in SharedTestEnv (slow on CPU) and runs
 # dozens of inference tests. The default CTest --timeout (600s) is not enough.
 set_tests_properties(sdk_integration_tests PROPERTIES TIMEOUT 1200)
+
+add_test(
+    NAME non_generative_sdk_tests
+    COMMAND non_generative_sdk_tests
+            --gtest_filter=-NonGenerativeSdkTest.Required*
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:non_generative_sdk_tests>
+)
+set_tests_properties(non_generative_sdk_tests PROPERTIES TIMEOUT 600)
 
 # ==========================================================================
 # Cache-only mode tests — tests external_service_url / cache-only catalog
@@ -486,4 +556,20 @@ gtest_discover_tests(cache_only_tests
     WORKING_DIRECTORY $<TARGET_FILE_DIR:cache_only_tests>
     DISCOVERY_MODE PRE_TEST
     DISCOVERY_TIMEOUT 60
+    PROPERTIES RUN_SERIAL TRUE
 )
+
+if(NOT CMAKE_CROSSCOMPILING AND NOT ANDROID AND NOT IOS)
+    add_test(NAME CTestSchedulingPolicy
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/ctest-scheduling-test.py
+            --ctest ${CMAKE_CTEST_COMMAND}
+            --build-dir ${PROJECT_BINARY_DIR}
+            --config $<CONFIG>
+            --unit-binary $<TARGET_FILE:foundry_local_tests>
+            "--parallel-filter=${foundry_parallel_filter}")
+endif()
+
+# Discovered Google Tests are registered at test time; the tests available
+# here are explicit add_test entries, including the single integration process.
+get_property(foundry_explicit_tests DIRECTORY PROPERTY TESTS)
+set_tests_properties(${foundry_explicit_tests} PROPERTIES RUN_SERIAL TRUE)

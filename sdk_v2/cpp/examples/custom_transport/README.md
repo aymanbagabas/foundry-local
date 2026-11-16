@@ -1,6 +1,7 @@
 # Custom model HTTP transport
 
 The native example registers an application-owned transport through the public C++ configuration wrapper.
+It requires a native runtime supporting API v5 or newer.
 It supplies an empty catalog through short in-memory reads, then checks cancellation and ownership.
 It does not download model weights or demonstrate resume behavior.
 An optional first argument selects the sample data directory; the default stays beside the executable.

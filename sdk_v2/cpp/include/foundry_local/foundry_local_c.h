@@ -60,7 +60,7 @@
  * Incremented with each release.
  * Used to request the API function table via FoundryLocalGetApi.
  * ----------------------------------------------------------------------- */
-#define FOUNDRY_LOCAL_API_VERSION 4
+#define FOUNDRY_LOCAL_API_VERSION 5
 
 // Payload schemas evolve independently of the function-table ABI.
 #define FOUNDRY_LOCAL_DATA_VERSION 2
@@ -214,6 +214,7 @@ typedef enum flDeviceType {
 typedef enum flCatalogType {
   FOUNDRY_LOCAL_CATALOG_PUBLIC = 0,
   FOUNDRY_LOCAL_CATALOG_LOCAL = 1,
+  FOUNDRY_LOCAL_CATALOG_AZURE_REGISTRY = 2,
 } flCatalogType;
 
 /// Tensor element data types. Values match ONNX TensorProto.DataType.
@@ -848,6 +849,10 @@ typedef struct flApi {
                 _Outptr_ flCatalog** out_catalog);
 
   // End V2
+  // V3 adds versioned inference structures without extending this table.
+  FL_API_STATUS(Manager_GetCatalogWithOptions, _In_ const flManager* manager, flCatalogType catalog_type,
+                _In_opt_ const flKeyValuePairs* options, _Outptr_ flCatalog** out_catalog);
+  // End V4
   /* Append new function pointers at the end for future versions and add marker for the end of each version */
 } flApi;
 
@@ -1119,14 +1124,14 @@ struct flConfigurationApi {
 
   // End V3
 
-  /// Optional. Override model HTTP transport; pass null to restore the default transport. Requires API version 4.
+  /// Optional. Override model HTTP transport; pass null to restore the default transport. Requires API version 5.
   /// Validates version and all callbacks, copies the table, and retains user_data before returning success.
   /// The caller may then discard the table itself. Replacement/clearing releases the configuration's previous context.
   /// Managers retain their own transport snapshot: this setter does not change any already-created manager.
   /// Validation failure leaves the existing configuration unchanged. Request/response lifetimes are in flHttpTransport.
   FL_API_STATUS(SetModelHttpTransport, _In_ flConfiguration* config, _In_opt_ const flHttpTransport* transport);
 
-  // End V4
+  // End V5
 };
 
 /* --- Catalog API ------------------------------------------------------- */

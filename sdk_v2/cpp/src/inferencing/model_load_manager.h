@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <future>
@@ -66,6 +67,22 @@ class ModelLoadManager {
     GenAIModelInstance* model = nullptr;  // non-owning pointer; lifetime managed by this class
   };
 
+  class PredictiveRequestLease {
+   public:
+    PredictiveRequestLease(PredictiveRequestLease&& other) noexcept;
+    PredictiveRequestLease& operator=(PredictiveRequestLease&&) = delete;
+    ~PredictiveRequestLease();
+
+    PredictiveRequestLease(const PredictiveRequestLease&) = delete;
+    PredictiveRequestLease& operator=(const PredictiveRequestLease&) = delete;
+
+   private:
+    friend class ModelLoadManager;
+    explicit PredictiveRequestLease(ModelLoadManager& manager)
+        : manager_(&manager) {}
+    ModelLoadManager* manager_;
+  };
+
   ModelLoadManager(
       IEpDetector& ep_detector, ILogger& logger,
       uint64_t non_generative_memory_budget_bytes =
@@ -80,7 +97,7 @@ class ModelLoadManager {
   /// @param model_path  Path to the model directory (must contain genai_config.json).
   /// @param model_id    Unique identifier for the model.
   /// @param ep_override Execution provider override (kDefault = use genai_config.json default,
-  ///                    or auto-select CUDA for generic-gpu models if available).
+  ///                    or auto-select CUDA for text generic-gpu models and WebGPU for multimodal ones if available).
   /// @returns LoadResult with status and non-owning pointer to the loaded model.
   LoadResult LoadModel(std::string_view model_path,
                        std::string_view model_id,
@@ -93,6 +110,7 @@ class ModelLoadManager {
   std::shared_ptr<void> AcquireNonGenerativeRuntime(
       Model& model,
       const std::function<void()>& on_admitted = {});
+  std::shared_ptr<void> AcquireLoadedNonGenerativeRuntime(Model& model);
   bool UnloadNonGenerativeRuntime(Model& model);
   bool IsModelLoaded(const Model& model) const;
   bool IsModelLoading(const Model& model) const;
@@ -100,6 +118,13 @@ class ModelLoadManager {
                              std::string_view model_path) const;
   bool UnloadModelArtifact(std::string_view model_id,
                            std::string_view model_path);
+  void RegisterPredictiveSession(void* identity,
+                                 std::function<void()> cancel,
+                                 std::function<void()> release);
+  void UnregisterPredictiveSession(void* identity) noexcept;
+  PredictiveRequestLease AcquirePredictiveRequest();
+  void WaitForPredictiveRequests();
+  void ReleasePredictiveSessions();
 
   /// Unload a previously loaded model.
   /// @returns true if the model was found and unloaded; false if the model was not loaded
@@ -107,13 +132,14 @@ class ModelLoadManager {
   /// @throws  FoundryLocalException(INVALID_USAGE) if the model still has live sessions.
   ///          Drop the sessions before unloading — using a model while unloading it is a
   ///          contract violation.
+  ///          An ID shared by multiple loaded artifacts requires the path overload.
   bool UnloadModel(std::string_view model_id);
 
   /// Unload only when the loaded model's normalized path matches `model_path`.
   /// Returns false when the ID is absent or belongs to a different path.
   bool UnloadModel(std::string_view model_id, std::string_view model_path);
 
-  /// Get a loaded model by ID. Returns nullptr if not loaded.
+  /// Get a loaded model by ID. Returns nullptr if not loaded; throws if multiple artifacts share the ID.
   /// The returned pointer is valid until UnloadModel is called for this model_id.
   GenAIModelInstance* GetLoadedModel(std::string_view model_id);
 
@@ -180,6 +206,7 @@ class ModelLoadManager {
       std::shared_ptr<const GenAIConfig> config = {});
 
   bool HasEP(const std::string& ep_name) const;
+  void ReleasePredictiveRequest() noexcept;
   NonGenerativePackageMetadata InspectNonGenerativePackage(Model& model);
   bool UnloadModel(std::string_view model_id, const std::string* normalized_model_path);
   GenAIModelInstance* GetLoadedModel(std::string_view model_id, const std::string* normalized_model_path);
@@ -198,6 +225,14 @@ class ModelLoadManager {
     std::shared_future<std::shared_ptr<ManagedModelRuntime>> runtime;
   };
   std::map<std::string, LoadingRuntimeEntry> loading_runtimes_;
+  std::mutex predictive_mutex_;
+  std::condition_variable predictive_condition_;
+  struct PredictiveSessionCallbacks {
+    std::function<void()> cancel;
+    std::function<void()> release;
+  };
+  std::map<void*, PredictiveSessionCallbacks> predictive_sessions_;
+  size_t active_predictive_requests_{};
   std::map<std::pair<std::string, std::string>,
            NonGenerativePackageMetadata>
       non_generative_packages_;

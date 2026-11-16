@@ -79,6 +79,29 @@ TEST(CanonicalToolPromptTest, InsertsExactlyOneSystemObjectWhenUserStartsConvers
   EXPECT_EQ(projected[1].at("content"), "unchanged user input");
 }
 
+TEST(CanonicalToolPromptTest, FencedToolOnlyInstructionsRequireTheNamedTool) {
+  ToolCallContext context;
+  context.tools_json = R"([{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}])";
+  context.tool_call_start = "<tool_call>";
+  context.tool_call_end = "</tool_call>";
+  context.text_output = false;
+  context.tool_output = true;
+  context.fenced_tool_call_output = true;
+  context.forced_tool = ForcedToolChoice{"lookup", ToolKind::kFunction};
+
+  const auto projected = nlohmann::json::parse(
+      BuildCanonicalToolMessagesJson({{FOUNDRY_LOCAL_ROLE_USER, "Find it."}}, context));
+  const auto instructions = projected.front().at("content").get<std::string>();
+  EXPECT_NE(instructions.find("You must call a declared tool"), std::string::npos);
+  EXPECT_NE(instructions.find("Emit one JSON code fence"), std::string::npos);
+  EXPECT_NE(instructions.find(
+                "```json\n[{\"name\":\"tool_name\",\"parameters\":{\"argument\":\"value\"}}]\n```"),
+            std::string::npos);
+  EXPECT_NE(instructions.find("Call exactly the tool \"lookup\""), std::string::npos);
+  EXPECT_EQ(instructions.find("dedicated tool boundary tokens"), std::string::npos);
+  EXPECT_EQ(instructions.find("If no tool is needed"), std::string::npos);
+}
+
 TEST(CanonicalToolPromptTest, HistoricalAssistantTextRetainsAnExplicitModeWithoutReinterpretingItsBytes) {
   ToolCallContext context;
   context.tools_json = R"([{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}])";
@@ -95,6 +118,69 @@ TEST(CanonicalToolPromptTest, HistoricalAssistantTextRetainsAnExplicitModeWithou
   context.tool_output = false;
   const auto ordinary = nlohmann::json::parse(BuildCanonicalToolMessagesJson(messages, context));
   EXPECT_EQ(ordinary.back().at("content"), text);
+}
+
+TEST(CanonicalToolPromptTest, AutomaticTurnsPrioritizeAnswerFramingWithoutChangingToolHistory) {
+  ToolCallContext context;
+  context.tools_json = R"([{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}])";
+  context.tool_plan = ToolCallPlan::Create(context.tools_json);
+  context.tool_output = true;
+  context.tool_call_start = "<tool_call>";
+  context.tool_call_end = "</tool_call>";
+  TranscriptMessage assistant(FOUNDRY_LOCAL_ROLE_ASSISTANT, "");
+  assistant.AppendToolCall(MakeSuppliedToolCall("call_lookup", "lookup", R"({"city":"Paris"})"));
+  const std::vector<TranscriptMessage> messages = {
+      {FOUNDRY_LOCAL_ROLE_USER, "What is the weather?"},
+      assistant,
+      TranscriptMessage::ToolResult("call_lookup", R"({"temperature_c":18.5})")};
+
+  const auto projected = nlohmann::json::parse(BuildCanonicalToolMessagesJson(messages, context));
+  ASSERT_EQ(projected.size(), 4u);
+  const auto instructions = projected.front().at("content").get<std::string>();
+  EXPECT_TRUE(instructions.starts_with("Do not forget the required MESSAGE framing after reasoning."));
+  EXPECT_NE(instructions.find("A tool call is not a substitute for an answer."), std::string::npos);
+  EXPECT_NE(instructions.find(context.tools_json), std::string::npos);
+  EXPECT_EQ(projected[2].at("content"),
+            R"(<tool_call>[{"name":"lookup","parameters":{"city":"Paris"}}]</tool_call>)");
+  EXPECT_EQ(projected[3].at("tool_call_id"), "call_lookup");
+  EXPECT_EQ(projected[3].at("content"), R"({"temperature_c":18.5})");
+}
+
+TEST(CanonicalToolPromptTest, AnswerFramingReminderDoesNotOverrideOtherOutputModes) {
+  ToolCallContext context;
+  context.tools_json = R"([{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}])";
+  context.tool_plan = ToolCallPlan::Create(context.tools_json);
+  context.tool_output = true;
+  context.tool_call_start = "<tool_call>";
+  context.tool_call_end = "</tool_call>";
+  const auto expect_no_reminder = [](const ToolCallContext& output_mode) {
+    const auto projected = nlohmann::json::parse(
+        BuildCanonicalToolMessagesJson({{FOUNDRY_LOCAL_ROLE_USER, "Find it."}}, output_mode));
+    const auto instructions = projected.front().at("content").get<std::string>();
+    EXPECT_EQ(instructions.find("Do not forget the required MESSAGE framing"), std::string::npos);
+    EXPECT_EQ(instructions.find("A tool call is not a substitute for an answer."), std::string::npos);
+  };
+
+  auto required = context;
+  required.text_output = false;
+  required.forced_tool = ForcedToolChoice{"lookup", ToolKind::kFunction};
+  expect_no_reminder(required);
+  required.fenced_tool_call_output = true;
+  expect_no_reminder(required);
+
+  auto explicit_guidance = context;
+  explicit_guidance.guidance_type = "lark_grammar";
+  explicit_guidance.guidance_data = R"(start: "answer")";
+  expect_no_reminder(explicit_guidance);
+
+  auto plain = context;
+  plain.tool_output = false;
+  expect_no_reminder(plain);
+
+  auto raw = context;
+  raw.tool_kinds["lookup"] = ToolKind::kCustom;
+  raw.raw_envelope = RawEnvelopeDescriptor{"lookup", "*** Begin Patch", "*** End Patch"};
+  expect_no_reminder(raw);
 }
 
 TEST(CanonicalToolPromptTest, InboundContractPreservesArgumentPropertyOrderInPrompt) {

@@ -127,6 +127,7 @@ std::vector<ToolDefinition> BuildJsonRequestToolDefinitions(
 void PopulateToolDefinitions(const std::vector<ToolDefinition>& definitions, ToolCallContext& context);
 void ResolveBuiltInRawEnvelope(ToolCallContext& context);
 void ApplyRawEnvelopeGuidance(ToolCallContext& context, ILogger& logger);
+void SelectSupportedToolProtocol(ToolCallContext& context);
 bool ShouldStartInsideReasoning(const ToolCallContext& context, bool prompt_opens_reasoning);
 ToolCallPayloadParser CreateToolCallPayloadParser(const ToolCallContext& context);
 void NormalizeToolOutputBatch(ToolCallStreamAccumulator::Output& output,
@@ -140,7 +141,8 @@ ToolCallStreamAccumulator::Output PushToolOutputSegment(
 ToolCallStreamAccumulator::Output FlushToolOutput(
     RawEnvelopeDetector* raw_detector,
     ToolCallStreamAccumulator& structured_accumulator,
-    bool natural_end = true);
+    bool natural_end = true,
+    bool discard_interrupted_selected_payload = false);
 ToolCallStreamAccumulator::Output AbortRawToolOutput(
     RawEnvelopeDetector* raw_detector);
 bool InsideToolOutput(const RawEnvelopeDetector* raw_detector,

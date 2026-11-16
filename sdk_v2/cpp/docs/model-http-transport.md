@@ -8,10 +8,17 @@ The interface covers catalog requests, registry resolution, blob enumeration, HE
 It does not cover telemetry, inference traffic, or execution-provider downloads.
 In shared-host mode, model acquisition and its callbacks stay in the client process.
 
+Azure Registry catalogs (`CatalogType::AzureRegistry`, introduced in API 4) are not yet supported with a custom
+transport. Creating one returns `FOUNDRY_LOCAL_ERROR_NOT_IMPLEMENTED` before initializing credentials or issuing
+requests, rather than bypassing the application's transport. The public catalog and its registry/blob acquisition
+paths support custom transports.
+
 ## Native interface
 
-Use API version 4 or later. A runtime that does not support this version cannot register a custom transport.
+Use API version 5 or later. A runtime that does not support this version cannot register a custom transport.
 Do not silently select an older API version when an application requests this feature.
+API 4 remains the catalog-options version; the C++ wrapper negotiates API 5, 4, 3, then 2 and rejects transport
+registration on API 4 and older without accessing the new configuration-table entry.
 
 Call `flConfigurationApi::SetModelHttpTransport` with a `flHttpTransport`.
 C++ applications can use `Configuration::SetModelHttpTransport`.
