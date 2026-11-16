@@ -26,10 +26,12 @@ include = [
 # GENERATE-DOCS.md).
 [package.metadata.docs.rs]
 default-target = "x86_64-unknown-linux-gnu"
+features = ["model-http-reqwest"]
 
 [features]
 default = []
 nightly = []
+model-http-reqwest = ["dep:bytes", "tokio/time"]
 
 [dependencies]
 libloading = "0.8"
@@ -40,7 +42,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 tokio-stream = "0.1"
 tokio-util = "0.7"
 futures-core = "0.3"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12.28", features = ["json"] }
+bytes = { version = "1", optional = true }
 urlencoding = "2"
 async-openai = { version = "=0.33.1", default-features = false, features = ["chat-completion-types", "embedding-types"] }
 
@@ -68,6 +71,11 @@ path = "examples/interactive_chat.rs"
 [[example]]
 name = "low_level_inference"
 path = "examples/low_level_inference.rs"
+
+[[example]]
+name = "reqwest_model_http_transport"
+path = "examples/reqwest_model_http_transport.rs"
+required-features = ["model-http-reqwest"]
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

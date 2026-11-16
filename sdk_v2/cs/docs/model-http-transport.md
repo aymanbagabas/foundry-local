@@ -34,16 +34,54 @@ lifetime, a per-operation connection-attempt guard) and exact HTTP version polic
 The guard rejects HttpClient's internal replay before opening another socket.
 This deliberately trades connection reuse for native
 coordinator ownership of retries. HTTP status codes (including 3xx, 4xx, 5xx) are returned
-as responses. TLS validation is never disabled.
+as responses. Default TLS validation is preserved unless the application explicitly
+supplies its own trust policy.
 
 On .NET 8/9 the adapter preserves escaped path/query text without URI canonicalization
 and uses Latin-1 header encoding to round-trip field bytes. Constructing the adapter
 from the netstandard2.0 assembly throws `PlatformNotSupportedException`: that platform's
 HttpClient API cannot prevent internal replay. The full custom transport interface
 and native registration remain available on netstandard2.0.
-For application-specific proxy, TLS, authentication, connection-pool or stricter
-wire-level requirements, implement `IModelHttpTransport` instead of injecting an
-arbitrarily configured `HttpClient` with unverifiable redirect/retry policies.
+
+### Application network settings (.NET 8/9)
+
+The overload `HttpClientModelHttpTransport(Action<SocketsHttpHandler> configureHandler)`
+invokes the callback **once**, synchronously, on a fresh **SDK-owned** handler before
+constructing its client. No caller-supplied handler/client is accepted or mutated.
+
+```csharp
+using var transport = new HttpClientModelHttpTransport(handler =>
+{
+    handler.Proxy = new WebProxy("http://127.0.0.1:8080");
+    handler.UseProxy = true;
+    handler.ConnectTimeout = TimeSpan.FromSeconds(10);
+    // Other supported settings include SslOptions (custom trust roots, TLS versions,
+    // client certificates) and ConnectCallback (custom DNS/connection routing).
+});
+```
+
+Proxy selection, connection timeout, concurrency and `SslOptions` are preserved.
+The SDK reapplies mandatory invariants **after** the callback: redirects,
+decompression, cookies, pooled connection reuse and automatic challenge credentials
+are disabled, and field encodings remain Latin-1. Credential-bearing explicit
+proxies are rejected without mutating their credentials, because automatic proxy
+challenge authentication may replay requests. For authentication schemes requiring
+challenge resubmission or other policies outside this contract, implement
+`IModelHttpTransport`.
+
+A configured `ConnectCallback` is preserved **behind** the per-operation one-attempt
+guard. It receives the original connection context and cancellation token and
+returns a plain connected stream; HttpClient still performs HTTP framing and TLS
+validation above it. The guard rejects a second attempt before invoking application
+code, including after a dropped response. Custom connection/stream callbacks must
+honor cancellation promptly and must not retry, redirect or decompress themselves.
+
+Do not retain, dispose, use or mutate the handler after the configuration callback.
+The SDK disposes it on callback/construction failure or transport disposal.
+Application-owned referenced objects (proxy settings, certificates, trust stores)
+and delegate captures must remain usable until the transport is disposed; do not
+mutate them during requests. The callback overload is not exposed by the
+netstandard2.0 assembly, whose custom transport support is unchanged.
 
 ## Custom implementation contract
 
@@ -98,6 +136,17 @@ dotnet run --project sdk_v2/cs/examples/ModelHttpTransport
 For an actual HTTP catalog endpoint, append `-- --http <catalog-url>`. That mode
 registers `HttpClientModelHttpTransport` through the same public configuration and
 prints the model count; unlike the default in-memory mode it performs network I/O.
+That mode now configures a ten-second connection timeout through the new callback.
+Append `--proxy <proxy-url>` to exercise explicit proxy routing, for example:
+
+```sh
+dotnet run --project sdk_v2/cs/examples/ModelHttpTransport -- \
+  --http http://catalog.invalid/catalog --proxy http://127.0.0.1:8080
+```
+
+This requires a running proxy (a deterministic local HTTP fixture returning
+`{"value":[]}` also works). The example asserts one configuration callback and
+registers this configured adapter through the real native manager, not a callback fake.
 
 Use the normal SDK native runtime package or local native redirect described in the
 README. The focused TUnit suite is `ModelHttpTransportTests`; invoke its executable

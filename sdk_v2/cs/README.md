@@ -10,7 +10,7 @@ For the v2 inference concepts and typed, stateful session examples, see
 - **Model catalog** — browse and search all available models; filter by cached or loaded state
 - **Bring your own model (BYOM)** — register existing local model assets without copying or taking ownership of them
 - **Lifecycle management** — download, load, unload, and remove models programmatically
-- **Custom model HTTP transport** — application-owned streaming HTTP with a safe `HttpClient` adapter;
+- **Custom model HTTP transport** — application-owned streaming HTTP with a safe, proxy/TLS/DNS-configurable `HttpClient` adapter;
   see [transport API and native registration example](docs/model-http-transport.md) (native API 5+)
 - **Chat completions** — synchronous and `IAsyncEnumerable` streaming via OpenAI-compatible types
 - **Audio transcription** — transcribe audio files with streaming support

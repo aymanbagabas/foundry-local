@@ -4,20 +4,32 @@
 // </copyright>
 // --------------------------------------------------------------------------------------------------------------------
 
+using System.Net;
 using System.Text;
 
 using Microsoft.AI.Foundry.Local;
 using Microsoft.Extensions.Logging.Abstractions;
 
 // Default: deterministic IN-MEMORY example, no network or model weights.
-// Optional: --http <catalog-url> registers the strict HttpClient adapter instead (performs real network I/O).
+// Optional: --http <catalog-url> [--proxy <proxy-url>] registers a configured HttpClient adapter.
 // Put generated cache/logs under ignored build output.
-if (args.Length != 0 && (args.Length != 2 || args[0] != "--http"))
+if (args.Length != 0 && ((args.Length != 2 && args.Length != 4) || args[0] != "--http" ||
+    (args.Length == 4 && args[2] != "--proxy")))
 {
-    throw new ArgumentException("Usage: ModelHttpTransport [--http <catalog-url>]");
+    throw new ArgumentException("Usage: ModelHttpTransport [--http <catalog-url> [--proxy <proxy-url>]]");
 }
 
-using var httpTransport = args.Length == 2 ? new HttpClientModelHttpTransport() : null;
+var configured = 0;
+using var httpTransport = args.Length >= 2 ? new HttpClientModelHttpTransport(handler =>
+{
+    configured++;
+    handler.ConnectTimeout = TimeSpan.FromSeconds(10);
+    if (args.Length == 4)
+    {
+        handler.UseProxy = true;
+        handler.Proxy = new WebProxy(new Uri(args[3], UriKind.Absolute));
+    }
+}) : null;
 var memoryTransport = new InMemoryTransport();
 IModelHttpTransport transport = httpTransport is null ? memoryTransport : httpTransport;
 var modelCount = 0;
@@ -42,7 +54,13 @@ using (var manager = FoundryLocalManager.Instance)
 
 if (httpTransport is not null)
 {
-    Console.WriteLine($"Native registered HttpClient transport: {modelCount} models.");
+    if (configured != 1)
+    {
+        throw new InvalidOperationException("The handler configuration must run exactly once.");
+    }
+
+    Console.WriteLine($"Native registered configured HttpClient transport: {modelCount} models, " +
+        $"{configured} configuration callback, explicit proxy: {args.Length == 4}.");
     return;
 }
 

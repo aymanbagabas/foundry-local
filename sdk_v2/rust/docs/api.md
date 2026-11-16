@@ -15,6 +15,7 @@
   - [Model](#model)
 - [Shared Serving](#shared-serving)
 - [Custom Model HTTP](#custom-model-http)
+  - [ReqwestTransport](#reqwesttransport)
 - [OpenAI Clients](#openai-clients)
   - [ChatClient](#chatclient)
   - [ChatCompletionStream](#chatcompletionstream)
@@ -223,6 +224,70 @@ General payloads remain at version 2; transport payloads use version 1.
 See [the runnable example](../examples/custom_model_http_transport.rs).
 It registers an application-owned catalog that returns `{"value":[]}`.
 The actual native manager consumes short reads without network access or model weights.
+
+### ReqwestTransport
+
+Available at the crate root with the optional `model-http-reqwest` feature.
+The neutral transport traits remain unchanged.
+The existing Reqwest dependency also serves the SDK's OpenAI clients.
+
+```rust
+#[derive(Clone)]
+pub struct ReqwestTransport { /* private fields; redacted Debug */ }
+
+impl ReqwestTransport {
+    pub fn new() -> Result<Self, FoundryLocalError>;
+    pub fn with_client_builder(
+        builder: reqwest::ClientBuilder,
+    ) -> Result<Self, FoundryLocalError>;
+}
+
+impl ModelHttpTransport for ReqwestTransport {
+    fn create_operation(
+        &self,
+        request: HttpRequest,
+    ) -> Result<Box<dyn ModelHttpOperation>, FoundryLocalError>;
+}
+```
+
+`new` uses default TLS, proxy, and connection settings.
+`with_client_builder` consumes a builder with application network policy.
+Applications can configure proxies, TLS roots, DNS, authentication headers, connection limits, or shorter timeouts.
+Both constructors enforce these final client settings:
+
+- No automatic retries.
+- No automatic redirects.
+- No automatic gzip, Brotli, deflate, or Zstandard decompression.
+
+The factory does not accept an opaque `reqwest::Client`.
+Mandatory settings also apply when dependency features enable compression elsewhere.
+Application-defined connector or resolver code remains the application's responsibility.
+
+Operation creation performs no network I/O.
+`send` returns the response head before the body arrives.
+`read` streams raw response chunks through bounded caller buffers.
+Duplicate header values and non-UTF-8 response values remain intact.
+Reqwest controls header name case and wire order.
+HTTP error status codes remain ordinary response heads.
+
+Cancellation interrupts pending send or read futures and returns `NativeErrorCode::OperationCancelled`.
+The total deadline spans `send`, every read, and application delays between calls.
+Deadline and network failures return `NativeErrorCode::Network`.
+Returned errors exclude URLs, credentials, and backend diagnostics.
+
+Each transport family owns one independent Tokio thread.
+Clones and operations retain it until their final drop.
+It accepts calls from native workers or an application runtime, including a current-thread runtime.
+Shutdown joins the thread without a Tokio runtime drop inside an async context.
+Platform DNS lookups already in progress can delay shutdown.
+
+The adapter preserves already encoded signed URL bytes.
+It rejects URLs that Reqwest normalizes, fragments, and embedded credentials with `NativeErrorCode::InvalidArgument`.
+For example, use a lowercase host without an explicit default port or dot segments.
+This rejects unsupported representations instead of silently changing a signature.
+
+See the [real HTTP example](../examples/reqwest_model_http_transport.rs).
+It registers the adapter through the native configuration and reads a chunked loopback catalog.
 
 ---
 

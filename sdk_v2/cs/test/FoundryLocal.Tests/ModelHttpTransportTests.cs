@@ -242,7 +242,99 @@ internal sealed class ModelHttpTransportTests
 
 #if NET8_0_OR_GREATER
     [Test]
-    public async Task HttpClientReturnsRedirectAndRawBodyWithoutRetryOrDecompression()
+    public async Task HandlerConfigurationPreservesNetworkSettingsAndEnforcesTransportPolicy()
+    {
+        var proxy = new WebProxy("http://127.0.0.1:1234");
+        var ssl = new System.Net.Security.SslClientAuthenticationOptions
+        {
+            EnabledSslProtocols = System.Security.Authentication.SslProtocols.Tls12,
+            ClientCertificates = new System.Security.Cryptography.X509Certificates.X509CertificateCollection()
+        };
+        System.Net.Http.SocketsHttpHandler? configured = null;
+        var calls = 0;
+        using (var transport = new HttpClientModelHttpTransport(handler =>
+        {
+            calls++;
+            configured = handler;
+            handler.Proxy = proxy;
+            handler.UseProxy = true;
+            handler.SslOptions = ssl;
+            handler.ConnectTimeout = TimeSpan.FromSeconds(7);
+            handler.MaxConnectionsPerServer = 3;
+            handler.AllowAutoRedirect = true;
+            handler.AutomaticDecompression = DecompressionMethods.All;
+            handler.UseCookies = true;
+            handler.Credentials = new NetworkCredential("unused", "unused");
+            handler.PreAuthenticate = true;
+            handler.DefaultProxyCredentials = new NetworkCredential("unused", "unused");
+            handler.PooledConnectionLifetime = TimeSpan.FromHours(1);
+            handler.RequestHeaderEncodingSelector = (_, _) => Encoding.UTF8;
+            handler.ResponseHeaderEncodingSelector = (_, _) => Encoding.UTF8;
+        }))
+        {
+            await Assert.That(calls).IsEqualTo(1);
+            var handler = configured ?? throw new InvalidOperationException("Configuration was not invoked.");
+            await Assert.That(ReferenceEquals(handler.Proxy, proxy)).IsTrue();
+            await Assert.That(ReferenceEquals(handler.SslOptions, ssl)).IsTrue();
+            await Assert.That(handler.UseProxy).IsTrue();
+            await Assert.That(handler.ConnectTimeout).IsEqualTo(TimeSpan.FromSeconds(7));
+            await Assert.That(handler.MaxConnectionsPerServer).IsEqualTo(3);
+            await Assert.That(handler.AllowAutoRedirect).IsFalse();
+            await Assert.That(handler.AutomaticDecompression).IsEqualTo(DecompressionMethods.None);
+            await Assert.That(handler.UseCookies).IsFalse();
+            await Assert.That(handler.Credentials).IsNull();
+            await Assert.That(handler.PreAuthenticate).IsFalse();
+            await Assert.That(handler.DefaultProxyCredentials).IsNull();
+            await Assert.That(handler.PooledConnectionLifetime).IsEqualTo(TimeSpan.Zero);
+            using var request = new System.Net.Http.HttpRequestMessage();
+            var requestEncoding = handler.RequestHeaderEncodingSelector
+                ?? throw new InvalidOperationException("Missing request encoding policy.");
+            var responseEncoding = handler.ResponseHeaderEncodingSelector
+                ?? throw new InvalidOperationException("Missing response encoding policy.");
+            await Assert.That(requestEncoding("x", request)).IsEqualTo(Encoding.Latin1);
+            await Assert.That(responseEncoding("x", request)).IsEqualTo(Encoding.Latin1);
+            await Assert.That(proxy.Credentials).IsNull(); // SDK did not mutate the caller's proxy.
+        }
+
+        // Test-only retained reference: assert SDK ownership, never reuse the handler in application code.
+        var disposed = configured ?? throw new InvalidOperationException("Configuration was not invoked.");
+        await Assert.That(() => disposed.ConnectTimeout = TimeSpan.FromSeconds(1)).Throws<ObjectDisposedException>();
+    }
+
+    [Test]
+    public async Task HandlerConfigurationFailureDisposesHandlerAndPreservesException()
+    {
+        // Deliberately pass null to verify the public argument guard.
+        await Assert.That(() => new HttpClientModelHttpTransport(null!)).Throws<ArgumentNullException>();
+        System.Net.Http.SocketsHttpHandler? configured = null;
+        var expected = new InvalidOperationException("configuration-failure");
+        try
+        {
+            using var transport = new HttpClientModelHttpTransport(handler =>
+            {
+                configured = handler;
+                throw expected;
+            });
+            Assert.Fail("Configuration failure must propagate.");
+        }
+        catch (InvalidOperationException error)
+        {
+            await Assert.That(ReferenceEquals(error, expected)).IsTrue();
+        }
+
+        var disposed = configured ?? throw new InvalidOperationException("Configuration was not invoked.");
+        await Assert.That(() => disposed.ConnectTimeout = TimeSpan.FromSeconds(1)).Throws<ObjectDisposedException>();
+        var credentials = new NetworkCredential("unused", "unused");
+        var proxy = new WebProxy("http://127.0.0.1:1234") { Credentials = credentials };
+        await Assert.That(() => new HttpClientModelHttpTransport(handler => handler.Proxy = proxy))
+            .Throws<ArgumentException>();
+        await Assert.That(ReferenceEquals(proxy.Credentials, credentials)).IsTrue();
+    }
+
+    [Test]
+    [Arguments(false)]
+    [Arguments(true)]
+    public async Task HttpClientReturnsRedirectAndRawBodyWithoutRetryOrDecompression(bool configure)
     {
         using var server = new TcpListener(IPAddress.Loopback, 0);
         server.Start();
@@ -271,7 +363,11 @@ internal sealed class ModelHttpTransportTests
             await stream.WriteAsync(rawBody);
             return (Encoding.ASCII.GetString(received.ToArray()), body);
         });
-        using var adapter = new HttpClientModelHttpTransport();
+        using var adapter = configure ? new HttpClientModelHttpTransport(handler =>
+        {
+            handler.AllowAutoRedirect = true;
+            handler.AutomaticDecompression = DecompressionMethods.All;
+        }) : new HttpClientModelHttpTransport();
         var url = $"http://127.0.0.1:{port}/a%2fb/../raw?sig=A%2Bb%2fC&x=1";
         var request = new ModelHttpRequest("POST", url, Array.Empty<ModelHttpHeader>(), new byte[] { 0, 255, 7 }, 0);
         using var operation = adapter.CreateOperation(request);
@@ -288,9 +384,11 @@ internal sealed class ModelHttpTransportTests
     }
 
     [Test]
-    [Arguments(false)]
-    [Arguments(true)]
-    public async Task HttpClientCancellationInterruptsRealSocketIo(bool duringRead)
+    [Arguments(false, false)]
+    [Arguments(true, false)]
+    [Arguments(false, true)]
+    [Arguments(true, true)]
+    public async Task HttpClientCancellationInterruptsRealSocketIo(bool duringRead, bool configure)
     {
         using var server = new TcpListener(IPAddress.Loopback, 0);
         server.Start();
@@ -320,7 +418,10 @@ internal sealed class ModelHttpTransportTests
             entered.TrySetResult(true);
             await finish.Task;
         });
-        using var transport = new HttpClientModelHttpTransport();
+        using var transport = configure
+            ? new HttpClientModelHttpTransport(handler => handler.ConnectCallback =
+                (context, token) => ConnectForTestAsync(context.DnsEndPoint, token))
+            : new HttpClientModelHttpTransport();
         using var operation = transport.CreateOperation(new ModelHttpRequest("GET", $"http://127.0.0.1:{port}/",
             Array.Empty<ModelHttpHeader>(), Array.Empty<byte>(), 0));
         using var cancellation = new CancellationTokenSource();
@@ -345,7 +446,9 @@ internal sealed class ModelHttpTransportTests
     }
 
     [Test]
-    public async Task HttpClientDoesNotReplayFailedRequests()
+    [Arguments(false)]
+    [Arguments(true)]
+    public async Task HttpClientDoesNotReplayFailedRequests(bool configure)
     {
         using var server = new TcpListener(IPAddress.Loopback, 0);
         server.Start();
@@ -368,7 +471,16 @@ internal sealed class ModelHttpTransportTests
             // Close after receiving the request, without sending ANY response bytes.
             return Encoding.ASCII.GetString(received.ToArray());
         });
-        using var transport = new HttpClientModelHttpTransport();
+        var attempts = 0;
+        using var transport = configure ? new HttpClientModelHttpTransport(handler =>
+        {
+            handler.PooledConnectionLifetime = TimeSpan.FromHours(1);
+            handler.ConnectCallback = (context, token) =>
+            {
+                Interlocked.Increment(ref attempts);
+                return ConnectForTestAsync(context.DnsEndPoint, token);
+            };
+        }) : new HttpClientModelHttpTransport();
         using var operation = transport.CreateOperation(new ModelHttpRequest("GET", $"http://127.0.0.1:{port}/",
             Array.Empty<ModelHttpHeader>(), Array.Empty<byte>(), 0));
         await Assert.That(async () => await Within(operation.SendAsync(CancellationToken.None)))
@@ -376,6 +488,207 @@ internal sealed class ModelHttpTransportTests
         await Within(served);
         await Assert.That((await served).Contains("Connection: close", StringComparison.OrdinalIgnoreCase)).IsTrue();
         await Assert.That(server.Pending()).IsFalse();
+        if (configure)
+        {
+            await Assert.That(attempts).IsEqualTo(1);
+        }
+    }
+
+    [Test]
+    public async Task CustomDnsRoutingPreservesHostAndRequestTarget()
+    {
+        using var server = new TcpListener(IPAddress.Loopback, 0);
+        server.Start();
+        var endpoint = (IPEndPoint)server.LocalEndpoint;
+        var served = Task.Run(async () =>
+        {
+            using var socket = await server.AcceptTcpClientAsync();
+            using var stream = socket.GetStream();
+            var request = await ReadHeadersAsync(stream);
+            await stream.WriteAsync(Encoding.ASCII.GetBytes("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"));
+            return request;
+        });
+        var attempts = 0;
+        string? hostname = null;
+        using var transport = new HttpClientModelHttpTransport(handler =>
+        {
+            handler.UseProxy = false;
+            handler.ConnectCallback = (context, token) =>
+            {
+                hostname = context.DnsEndPoint.Host;
+                Interlocked.Increment(ref attempts);
+                return ConnectForTestAsync(endpoint, token);
+            };
+        });
+        using var operation = transport.CreateOperation(new ModelHttpRequest("GET",
+            "http://custom-dns.invalid/catalog?sig=Keep%2BExactly", Array.Empty<ModelHttpHeader>(), Array.Empty<byte>(), 0));
+        await Assert.That(attempts).IsEqualTo(0); // Configuration and operation allocation perform no network I/O.
+        var head = await operation.SendAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+        var buffer = new byte[2];
+        var read = await operation.ReadAsync(buffer, CancellationToken.None);
+        var received = await served.WaitAsync(TimeSpan.FromSeconds(5));
+        await Assert.That(head.StatusCode).IsEqualTo(200);
+        await Assert.That(read).IsEqualTo(2);
+        await Assert.That(Encoding.ASCII.GetString(buffer)).IsEqualTo("ok");
+        await Assert.That(hostname).IsEqualTo("custom-dns.invalid");
+        await Assert.That(attempts).IsEqualTo(1);
+        await Assert.That(received.StartsWith("GET /catalog?sig=Keep%2BExactly HTTP/1.1\r\n", StringComparison.Ordinal)).IsTrue();
+        await Assert.That(received.Contains("Host: custom-dns.invalid\r\n", StringComparison.OrdinalIgnoreCase)).IsTrue();
+    }
+
+    [Test]
+    public async Task ConfiguredConnectorHonorsCancellationWhileBlocked()
+    {
+        var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var transport = new HttpClientModelHttpTransport(handler =>
+        {
+            handler.UseProxy = false;
+            handler.ConnectCallback = async (_, token) =>
+            {
+                entered.TrySetResult(true);
+                await Task.Delay(Timeout.Infinite, token);
+                throw new InvalidOperationException("Cancelled connector must not complete normally.");
+            };
+        });
+        using var operation = transport.CreateOperation(new ModelHttpRequest("GET", "http://blocked.invalid/",
+            Array.Empty<ModelHttpHeader>(), Array.Empty<byte>(), 0));
+        using var cancellation = new CancellationTokenSource();
+        var pending = operation.SendAsync(cancellation.Token);
+        await Within(entered.Task);
+        cancellation.Cancel();
+        await Assert.That(async () => await Within(pending)).Throws<OperationCanceledException>();
+    }
+
+    [Test]
+    public async Task ConfiguredCustomRootTrustWorksWithCustomDnsAndRealTls()
+    {
+        using var key = System.Security.Cryptography.RSA.Create(2048);
+        var certificateRequest = new System.Security.Cryptography.X509Certificates.CertificateRequest(
+            "CN=trusted.invalid", key, System.Security.Cryptography.HashAlgorithmName.SHA256,
+            System.Security.Cryptography.RSASignaturePadding.Pkcs1);
+        var names = new System.Security.Cryptography.X509Certificates.SubjectAlternativeNameBuilder();
+        names.AddDnsName("trusted.invalid");
+        certificateRequest.CertificateExtensions.Add(names.Build());
+        certificateRequest.CertificateExtensions.Add(
+            new System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension(true, false, 0, true));
+        using var certificate = certificateRequest.CreateSelfSigned(
+            DateTimeOffset.UtcNow.AddMinutes(-1), DateTimeOffset.UtcNow.AddMinutes(5));
+        var trust = new System.Security.Cryptography.X509Certificates.X509ChainPolicy
+        {
+            TrustMode = System.Security.Cryptography.X509Certificates.X509ChainTrustMode.CustomRootTrust,
+            RevocationMode = System.Security.Cryptography.X509Certificates.X509RevocationMode.NoCheck
+        };
+        trust.CustomTrustStore.Add(certificate);
+        using var server = new TcpListener(IPAddress.Loopback, 0);
+        server.Start();
+        var endpoint = (IPEndPoint)server.LocalEndpoint;
+        var served = Task.Run(async () =>
+        {
+            using var socket = await server.AcceptTcpClientAsync();
+            using var stream = new System.Net.Security.SslStream(socket.GetStream());
+            await stream.AuthenticateAsServerAsync(new System.Net.Security.SslServerAuthenticationOptions
+            {
+                ServerCertificate = certificate,
+                EnabledSslProtocols = System.Security.Authentication.SslProtocols.Tls12
+            });
+            var received = await ReadHeadersAsync(stream);
+            await stream.WriteAsync(Encoding.ASCII.GetBytes("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
+            return received;
+        });
+        using var transport = new HttpClientModelHttpTransport(handler =>
+        {
+            handler.UseProxy = false;
+            handler.ConnectCallback = (_, token) => ConnectForTestAsync(endpoint, token);
+            handler.SslOptions.CertificateChainPolicy = trust;
+            handler.SslOptions.EnabledSslProtocols = System.Security.Authentication.SslProtocols.Tls12;
+        });
+        using var operation = transport.CreateOperation(new ModelHttpRequest("GET", "https://trusted.invalid/",
+            Array.Empty<ModelHttpHeader>(), Array.Empty<byte>(), 0));
+        var head = await operation.SendAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+        var received = await served.WaitAsync(TimeSpan.FromSeconds(5));
+        await Assert.That(head.StatusCode).IsEqualTo(200);
+        await Assert.That(received.Contains("Host: trusted.invalid\r\n", StringComparison.OrdinalIgnoreCase)).IsTrue();
+        await Assert.That(trust.CustomTrustStore.Count).IsEqualTo(1);
+        // No certificate-validation bypass callback and no machine trust-store modification.
+    }
+
+    [Test]
+    public async Task ConfiguredProxyIsUsedThroughActualNativeRegistration()
+    {
+        using var server = new TcpListener(IPAddress.Loopback, 0);
+        server.Start();
+        var port = ((IPEndPoint)server.LocalEndpoint).Port;
+        var served = Task.Run(async () =>
+        {
+            using var socket = await server.AcceptTcpClientAsync();
+            using var stream = socket.GetStream();
+            var headers = await ReadHeadersAsync(stream);
+            var lengthLine = headers.Split("\r\n").Single(h => h.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase));
+            var body = new byte[int.Parse(lengthLine.Substring("Content-Length:".Length).Trim(),
+                System.Globalization.CultureInfo.InvariantCulture)];
+            await stream.ReadExactlyAsync(body);
+            await stream.WriteAsync(Encoding.ASCII.GetBytes(
+                "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nContent-Type: application/json\r\n\r\n{\"value\":[]}"));
+            return headers;
+        });
+        var calls = 0;
+        using var transport = new HttpClientModelHttpTransport(handler =>
+        {
+            calls++;
+            handler.Proxy = new WebProxy($"http://127.0.0.1:{port}");
+            handler.UseProxy = true;
+            handler.ConnectTimeout = TimeSpan.FromSeconds(3);
+        });
+        await FoundryLocalManager.CreateAsync(new PublicConfiguration
+        {
+            AppName = "cs-configured-proxy",
+            AppDataDir = Path.Combine(AppContext.BaseDirectory, "TestResults", Guid.NewGuid().ToString("N")),
+            CatalogUrls = new List<(string, string?)> { ("http://catalog.invalid/catalog?sig=Keep%2BExactly", null) },
+            ModelHttpTransport = transport,
+            DisableNonessentialTelemetry = true
+        }, NullLogger.Instance);
+        using (var manager = FoundryLocalManager.Instance)
+        {
+            var catalog = await manager.GetCatalogAsync();
+            await Assert.That((await catalog.ListModelsAsync()).Count).IsEqualTo(0);
+        }
+
+        var received = await served.WaitAsync(TimeSpan.FromSeconds(5));
+        await Assert.That(calls).IsEqualTo(1);
+        await Assert.That(received.StartsWith(
+            "POST http://catalog.invalid/catalog?sig=Keep%2BExactly HTTP/1.1\r\n", StringComparison.Ordinal)).IsTrue();
+        await Assert.That(server.Pending()).IsFalse();
+    }
+
+    private static async ValueTask<Stream> ConnectForTestAsync(EndPoint endpoint, CancellationToken token)
+    {
+        var socket = new Socket(SocketType.Stream, ProtocolType.Tcp);
+        try
+        {
+            await socket.ConnectAsync(endpoint, token);
+            return new NetworkStream(socket, ownsSocket: true);
+        }
+        catch
+        {
+            socket.Dispose();
+            throw;
+        }
+    }
+
+    private static async Task<string> ReadHeadersAsync(Stream stream)
+    {
+        var received = new List<byte>();
+        var one = new byte[1];
+        while (await stream.ReadAsync(one) == 1)
+        {
+            received.Add(one[0]);
+            if (Encoding.ASCII.GetString(received.ToArray()).EndsWith("\r\n\r\n", StringComparison.Ordinal))
+            {
+                return Encoding.ASCII.GetString(received.ToArray());
+            }
+        }
+
+        throw new EndOfStreamException("Expected HTTP headers.");
     }
 #endif
 
