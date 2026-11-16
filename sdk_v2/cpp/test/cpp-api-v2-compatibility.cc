@@ -7,6 +7,10 @@
 
 struct flConfiguration {};
 struct flKeyValuePairs {};
+struct flStatus {
+  flErrorCode code;
+  const char* message;
+};
 
 namespace {
 
@@ -17,6 +21,21 @@ int configurations_released = 0;
 int options_applied = 0;
 uint32_t runtime_api_version = 2;
 std::vector<uint32_t> requested_versions;
+flStatus callback_status{};
+int statuses_created = 0;
+int statuses_released = 0;
+
+flStatus* FL_API_CALL CreateStatus(flErrorCode code, const char* message) noexcept {
+  ++statuses_created;
+  callback_status = {code, message};
+  return &callback_status;
+}
+
+void FL_API_CALL ReleaseStatus(flStatus*) noexcept { ++statuses_released; }
+
+flErrorCode FL_API_CALL StatusCode(const flStatus* status) noexcept { return status->code; }
+
+const char* FL_API_CALL StatusMessage(const flStatus* status) noexcept { return status->message; }
 
 flStatus* FL_API_CALL CreateConfiguration(const char*, flConfiguration** output) noexcept {
   ++configurations_created;
@@ -60,6 +79,10 @@ extern "C" const flApi* FL_API_CALL FoundryLocalGetApi(uint32_t version) noexcep
     table.CreateKeyValuePairs = CreateOptions;
     table.AddKeyValuePair = AddOption;
     table.KeyValuePairs_Release = ReleaseOptions;
+    table.Status_Create = CreateStatus;
+    table.Status_Release = ReleaseStatus;
+    table.Status_GetErrorCode = StatusCode;
+    table.Status_GetErrorMessage = StatusMessage;
     return table;
   }();
   return version <= runtime_api_version ? &api : nullptr;
@@ -95,6 +118,18 @@ int main(int argc, char** argv) {
     expected_versions.push_back(runtime_api_version);
     if (requested_versions != expected_versions) {
       throw std::runtime_error("C++ wrapper did not try API versions in descending order");
+    }
+
+    bool callback_error_received = false;
+    try {
+      foundry_local::Check(foundry_local::CreateStatus(FOUNDRY_LOCAL_ERROR_NETWORK, "callback network failure"));
+    } catch (const foundry_local::Error& error) {
+      callback_error_received =
+          error.Code() == FOUNDRY_LOCAL_ERROR_NETWORK && std::string(error.what()) == "callback network failure";
+    }
+
+    if (!callback_error_received || statuses_created != 1 || statuses_released != 1) {
+      throw std::runtime_error("C++ wrapper did not create and release the callback status in the negotiated runtime");
     }
 
     {

@@ -67,6 +67,10 @@ inline void Check(flStatus* status) {
   }
 }
 
+inline flStatus* CreateStatus(flErrorCode code, const char* message) {
+  return detail::api()->Status_Create(code, message);
+}
+
 inline const char* Version() noexcept {
   return FoundryLocalGetVersionString();
 }

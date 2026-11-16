@@ -61,6 +61,9 @@ class Error : public std::runtime_error {
 /// Check a C API status; throw Error if non-null (non-null = error).
 inline void Check(flStatus* status);
 
+/// Create an owned status in this runtime. Transfer it through a C callback, or pass it to Check to release it.
+inline flStatus* CreateStatus(flErrorCode code, const char* message);
+
 /// Get the library version string.
 inline const char* Version() noexcept;
 
