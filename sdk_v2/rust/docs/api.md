@@ -14,6 +14,8 @@
   - [Catalog](#catalog)
   - [Model](#model)
 - [Shared Serving](#shared-serving)
+- [Custom Model HTTP](#custom-model-http)
+  - [ReqwestTransport](#reqwesttransport)
 - [OpenAI Clients](#openai-clients)
   - [ChatClient](#chatclient)
   - [ChatCompletionStream](#chatcompletionstream)
@@ -134,6 +136,7 @@ pub struct FoundryLocalConfig { /* private fields */ }
 | `catalog_url` | `fn catalog_url(self, url: impl Into<String>) -> Self` | Add a catalog source URL (no filter override). May be called multiple times. |
 | `catalog_url_with_filter` | `fn catalog_url_with_filter(self, url: impl Into<String>, filter_override: impl Into<String>) -> Self` | Add a catalog source URL with a filter override. |
 | `catalog_region` | `fn catalog_region(self, region: impl Into<String>) -> Self` | Set the Azure region used by the catalog service. |
+| `model_http_transport` | `fn model_http_transport(self, transport: Arc<dyn ModelHttpTransport>) -> Self` | Supply application HTTP for native model requests. Requires native API v5. The default transport does not change when unset. |
 | `library_path` | `fn library_path(self, path: impl Into<String>) -> Self` | Override the path to the native core library. |
 | `additional_setting` | `fn additional_setting(self, key: impl Into<String>, value: impl Into<String>) -> Self` | Add a key-value pair to additional settings. |
 | `logger` | `fn logger(self, logger: impl Logger + 'static) -> Self` | Provide an application logger (stub — not yet wired into native core). |
@@ -144,6 +147,147 @@ let config = FoundryLocalConfig::new("my_app")
     .log_level(LogLevel::Debug)
     .model_cache_dir("/path/to/cache");
 ```
+
+---
+
+## Custom Model HTTP
+
+The application supplies HTTP through two synchronous traits.
+All types below are available at the crate root.
+The native coordinator retains its existing HTTP policy.
+OpenAI clients do not use this transport.
+The current native runtime rejects custom transport for Azure Registry catalogs.
+
+```rust
+pub trait ModelHttpTransport: Send + Sync + 'static {
+    fn create_operation(
+        &self,
+        request: HttpRequest,
+    ) -> Result<Box<dyn ModelHttpOperation>, FoundryLocalError>;
+}
+
+pub trait ModelHttpOperation: Send + Sync + 'static {
+    fn send(&self) -> Result<HttpResponseHead, FoundryLocalError>;
+    fn read(&self, buffer: &mut [u8]) -> Result<usize, FoundryLocalError>;
+    fn cancel(&self);
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpHeader {
+    pub name: String,
+    pub value: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpRequest {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<HttpHeader>,
+    pub body: Vec<u8>,
+    pub timeout: Option<std::time::Duration>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpResponseHead {
+    pub status_code: u32,
+    pub headers: Vec<HttpHeader>,
+}
+```
+
+- `create_operation` receives an independent request copy. It creates local state without network I/O or waits for network activity.
+- `send` performs one request. It returns the response head without buffering the body.
+- The transport must not retry, follow redirects, or decompress responses.
+- Header vectors preserve order and duplicate names. Names use ASCII HTTP tokens; values support non-UTF-8 bytes.
+- Header values must not contain NUL, CR, LF, DEL, or other controls except HTAB.
+- Status codes must be 100 through 599. HTTP error codes are valid results, not transport failures.
+- `read` returns at most the buffer length. Short reads are valid. Zero means permanent EOF.
+- `timeout` is a total budget from `send` through all reads. `None` means no deadline.
+- The application enforces the deadline and interrupts its pending I/O on cancellation.
+- `send` and `read` execute serially for each operation. Distinct operations can execute concurrently on SDK worker threads.
+- `cancel` can run concurrently or precede `send`. It must be nonblocking, thread-safe, idempotent, and sticky.
+- The bridge rejects later calls after cancellation with `NativeErrorCode::OperationCancelled`.
+- Use `FoundryLocalError::Native` with `NativeErrorCode::Network` for transport failures.
+- The bridge replaces callback diagnostics with a fixed message. It does not expose request secrets in returned errors.
+- Trait methods and destructors must not panic. Fallible callback panics become internal errors.
+- A cancellation or destructor panic aborts the process. Rust panic hooks still run.
+
+The bridge retains response headers until operation release.
+Its context retains the native library through all callbacks, without an SDK reference cycle.
+Native configurations and managers own independent transport snapshots.
+As with other settings, a live manager keeps the first configuration.
+
+Registration requires native API v5.
+API v2–v4 remain supported when this setting is absent.
+A configured transport on those runtimes returns `NativeErrorCode::NotImplemented`.
+General payloads remain at version 2; transport payloads use version 1.
+
+See [the runnable example](../examples/custom_model_http_transport.rs).
+It registers an application-owned catalog that returns `{"value":[]}`.
+The actual native manager consumes short reads without network access or model weights.
+
+### ReqwestTransport
+
+Available at the crate root with the optional `model-http-reqwest` feature.
+The neutral transport traits remain unchanged.
+The existing Reqwest dependency also serves the SDK's OpenAI clients.
+
+```rust
+#[derive(Clone)]
+pub struct ReqwestTransport { /* private fields; redacted Debug */ }
+
+impl ReqwestTransport {
+    pub fn new() -> Result<Self, FoundryLocalError>;
+    pub fn with_client_builder(
+        builder: reqwest::ClientBuilder,
+    ) -> Result<Self, FoundryLocalError>;
+}
+
+impl ModelHttpTransport for ReqwestTransport {
+    fn create_operation(
+        &self,
+        request: HttpRequest,
+    ) -> Result<Box<dyn ModelHttpOperation>, FoundryLocalError>;
+}
+```
+
+`new` uses default TLS, proxy, and connection settings.
+`with_client_builder` consumes a builder with application network policy.
+Applications can configure proxies, TLS roots, DNS, authentication headers, connection limits, or shorter timeouts.
+Both constructors enforce these final client settings:
+
+- No automatic retries.
+- No automatic redirects.
+- No automatic gzip, Brotli, deflate, or Zstandard decompression.
+
+The factory does not accept an opaque `reqwest::Client`.
+Mandatory settings also apply when dependency features enable compression elsewhere.
+Application-defined connector or resolver code remains the application's responsibility.
+
+Operation creation performs no network I/O.
+`send` returns the response head before the body arrives.
+`read` streams raw response chunks through bounded caller buffers.
+Duplicate header values and non-UTF-8 response values remain intact.
+Reqwest controls header name case and wire order.
+HTTP error status codes remain ordinary response heads.
+
+Cancellation interrupts pending send or read futures and returns `NativeErrorCode::OperationCancelled`.
+The total deadline spans `send`, every read, and application delays between calls.
+Deadline and network failures return `NativeErrorCode::Network`.
+Returned errors exclude URLs, credentials, and backend diagnostics.
+
+Each transport family owns one independent Tokio thread.
+Clones and operations retain it until their final drop.
+It accepts calls from native workers or an application runtime, including a current-thread runtime.
+Shutdown joins the thread without a Tokio runtime drop inside an async context.
+Platform DNS lookups already in progress can delay shutdown.
+
+The adapter preserves already encoded signed URL bytes.
+It rejects URLs that Reqwest normalizes, fragments, and embedded credentials with `NativeErrorCode::InvalidArgument`.
+For example, use a lowercase host without an explicit default port or dot segments.
+This rejects unsupported representations instead of silently changing a signature.
+
+See the [real HTTP example](../examples/reqwest_model_http_transport.rs).
+It registers the adapter through the native configuration and reads a chunked loopback catalog.
 
 ---
 

@@ -18,7 +18,53 @@ use std::os::raw::{c_char, c_int};
 pub const FOUNDRY_LOCAL_API_VERSION: u32 = 2;
 
 /// Latest function-table version understood by this binding; payload versions remain 2.
-pub const FOUNDRY_LOCAL_LATEST_API_VERSION: u32 = 4;
+pub const FOUNDRY_LOCAL_LATEST_API_VERSION: u32 = 5;
+
+pub const FOUNDRY_LOCAL_HTTP_TRANSPORT_VERSION: u32 = 1;
+
+#[repr(C)]
+pub struct flHttpHeader {
+    pub name: *const c_char,
+    pub value: *const c_char,
+}
+
+#[repr(C)]
+pub struct flHttpRequestData {
+    pub version: u32,
+    pub method: *const c_char,
+    pub url: *const c_char,
+    pub headers: *const flHttpHeader,
+    pub header_count: usize,
+    pub body: *const u8,
+    pub body_size: usize,
+    pub timeout_ms: u64,
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct flHttpResponseData {
+    pub version: u32,
+    pub status_code: u32,
+    pub headers: *const flHttpHeader,
+    pub header_count: usize,
+}
+
+#[repr(C)]
+pub struct flHttpTransport {
+    pub version: u32,
+    pub user_data: *mut c_void,
+    pub Retain: unsafe extern "system" fn(*mut c_void),
+    pub Release: unsafe extern "system" fn(*mut c_void),
+    pub CreateOperation: unsafe extern "system" fn(
+        *mut c_void,
+        *const flHttpRequestData,
+        *mut *mut c_void,
+    ) -> flStatusPtr,
+    pub Send: unsafe extern "system" fn(*mut c_void, *mut flHttpResponseData) -> flStatusPtr,
+    pub Read: unsafe extern "system" fn(*mut c_void, *mut u8, usize, *mut usize) -> flStatusPtr,
+    pub Cancel: unsafe extern "system" fn(*mut c_void),
+    pub ReleaseOperation: unsafe extern "system" fn(*mut c_void),
+}
 
 // ── Opaque handle types ──────────────────────────────────────────────────────
 
@@ -727,6 +773,18 @@ pub type FlSetUseSharedHostFn =
 pub struct flConfigurationApiV3Vtable {
     pub prefix: flConfigurationApiVtable,
     pub SetUseSharedHost: Option<FlSetUseSharedHostFn>,
+}
+
+pub type FlSetModelHttpTransportFn = unsafe extern "system" fn(
+    config: *mut flConfiguration,
+    transport: *const flHttpTransport,
+) -> flStatusPtr;
+
+/// Version-5 extension; slot 12 follows the unchanged version-3 prefix.
+#[repr(C)]
+pub struct flConfigurationApiV5Vtable {
+    pub prefix: flConfigurationApiV3Vtable,
+    pub SetModelHttpTransport: Option<FlSetModelHttpTransportFn>,
 }
 
 /// Catalog API table (`flCatalogApi`).

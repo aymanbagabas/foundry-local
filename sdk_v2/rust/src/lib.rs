@@ -8,8 +8,11 @@ mod error;
 mod foundry_local_manager;
 mod item;
 mod item_queue;
+mod model_http_transport;
 mod non_generative;
 mod request;
+#[cfg(feature = "model-http-reqwest")]
+mod reqwest_transport;
 mod response;
 mod session;
 mod types;
@@ -27,12 +30,17 @@ pub use self::item::{
     SpeechSegmentKind, SpeechWord, Tensor, TensorDataType, TextKind, ToolCall, ToolResult,
 };
 pub use self::item_queue::ItemQueue;
+pub use self::model_http_transport::{
+    HttpHeader, HttpRequest, HttpResponseHead, ModelHttpOperation, ModelHttpTransport,
+};
 pub use self::non_generative::{
     DecisionAnswer, DecisionAnswerValue, DecisionQuestion, DecisionQuestionType, DecisionRequest,
     DecisionResult, DecisionSession, DecisionUsage, RankedCandidate, RankingRequest, RankingResult,
     RankingSession,
 };
 pub use self::request::{Request, RequestOptions, SearchOptions, ToolChoice};
+#[cfg(feature = "model-http-reqwest")]
+pub use self::reqwest_transport::ReqwestTransport;
 pub use self::response::{FinishReason, Response, Usage};
 pub use self::session::{
     AudioSession, ChatSession, CustomToolDefinition, EmbeddingsSession, ItemStream,
