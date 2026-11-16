@@ -71,6 +71,14 @@ public class Configuration
     public bool UseSharedHost { get; init; }
 
     /// <summary>
+    /// Optional client-local HTTP transport for public catalog, registry and blob acquisition.
+    /// Requires native API 5. AzureRegistry catalogs are not supported with this option.
+    /// The caller owns the transport and must keep it usable until this manager is disposed.
+    /// Changing configuration does not change an existing manager's transport.
+    /// </summary>
+    public IModelHttpTransport? ModelHttpTransport { get; init; }
+
+    /// <summary>
     /// Catalog URLs with optional per-catalog filter overrides.
     /// Each entry is a (url, filter) pair where filter may be null to use the default.
     /// Prefix catalog-v2 deployment-option values with <c>deploymentOptions=</c>.

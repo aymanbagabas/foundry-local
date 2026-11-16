@@ -4,6 +4,8 @@
 
 [Configuration](./microsoft.ai.foundry.local.configuration.md)
 
+[Model HTTP transport interfaces, immutable HTTP types and HttpClient adapter](../model-http-transport.md)
+
 [DeviceType](./microsoft.ai.foundry.local.devicetype.md)
 
 [EpDownloadResult](./microsoft.ai.foundry.local.epdownloadresult.md)
