@@ -212,6 +212,58 @@ internal sealed class ModelHttpTransportTests
     }
 
     [Test]
+    [Arguments(false)]
+    [Arguments(true)]
+    public async Task NativeCancellationCannotOverrideManagedDeadline(bool duringRead)
+    {
+        var resume = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var transport = new TestTransport
+        {
+            BlockSend = !duringRead,
+            BlockRead = duringRead,
+            ResumeAfterCancellation = resume
+        };
+        using var fixture = new CallbackFixture(transport, timeout: 100);
+        if (duringRead)
+        {
+            fixture.Send();
+        }
+
+        var pending = Task.Run(() =>
+        {
+            try
+            {
+                if (duringRead)
+                {
+                    fixture.Read();
+                }
+                else
+                {
+                    fixture.Send();
+                }
+            }
+            catch (FoundryLocalException error)
+            {
+                return error.ErrorCode;
+            }
+
+            return FoundryLocalErrorCode.Ok;
+        });
+        try
+        {
+            await Within(transport.CancellationObserved.Task);
+            fixture.Table.Cancel(fixture.Operation);
+        }
+        finally
+        {
+            resume.TrySetResult(true);
+        }
+
+        await Within(pending);
+        await Assert.That(await pending).IsEqualTo(FoundryLocalErrorCode.Network);
+    }
+
+    [Test]
     [Arguments("create")]
     [Arguments("send")]
     [Arguments("read")]
@@ -613,6 +665,64 @@ internal sealed class ModelHttpTransportTests
     }
 
     [Test]
+    public async Task RegisteredNativeDeadlineInterruptsBlockedSocketRead()
+    {
+        using var server = new TcpListener(IPAddress.Loopback, 0);
+        server.Start();
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+        var port = ((IPEndPoint)server.LocalEndpoint).Port;
+        var interrupted = false;
+        var served = Task.Run(async () =>
+        {
+            using var socket = await server.AcceptTcpClientAsync(deadline.Token);
+            using var stream = socket.GetStream();
+            var headers = await ReadHeadersAsync(stream).WaitAsync(deadline.Token);
+            var length = headers.Split("\r\n").Single(h => h.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase));
+            var body = new byte[int.Parse(length.Substring("Content-Length:".Length).Trim(),
+                System.Globalization.CultureInfo.InvariantCulture)];
+            await stream.ReadExactlyAsync(body, deadline.Token);
+            await stream.WriteAsync(Encoding.ASCII.GetBytes(
+                "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"),
+                deadline.Token);
+            // Leave the real response body blocked until the registered native deadline cancels it.
+            try
+            {
+                interrupted = await stream.ReadAsync(new byte[1], deadline.Token) == 0;
+            }
+            catch (IOException)
+            {
+                interrupted = true; // Cancellation can reset the peer instead of sending EOF.
+            }
+        });
+        using var transport = new HttpClientModelHttpTransport(handler => handler.UseProxy = false);
+        try
+        {
+            await FoundryLocalManager.CreateAsync(new PublicConfiguration
+            {
+                AppName = "cs-native-deadline",
+                AppDataDir = Path.Combine(AppContext.BaseDirectory, "TestResults", Guid.NewGuid().ToString("N")),
+                CatalogUrls = new List<(string, string?)> { ($"http://127.0.0.1:{port}/catalog", null) },
+                ModelHttpTransport = transport,
+                DisableNonessentialTelemetry = true
+            }, NullLogger.Instance);
+            using (var manager = FoundryLocalManager.Instance)
+            {
+                var catalog = await manager.GetCatalogAsync().WaitAsync(deadline.Token);
+                await Assert.That((await catalog.ListModelsAsync().WaitAsync(deadline.Token)).Count).IsEqualTo(0);
+            }
+
+            await served;
+            await Assert.That(interrupted).IsTrue();
+        }
+        finally
+        {
+            deadline.Cancel();
+            server.Stop();
+            await served;
+        }
+    }
+
+    [Test]
     public async Task ConfiguredProxyIsUsedThroughActualNativeRegistration()
     {
         using var server = new TcpListener(IPAddress.Loopback, 0);
@@ -803,6 +913,8 @@ internal sealed class ModelHttpTransportTests
         internal string? FailurePhase;
         internal ModelHttpRequest? LastRequest;
         internal readonly TaskCompletionSource<bool> Entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal readonly TaskCompletionSource<bool> CancellationObserved = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal TaskCompletionSource<bool>? ResumeAfterCancellation;
 
         public IModelHttpOperation CreateOperation(ModelHttpRequest request)
         {
@@ -821,6 +933,25 @@ internal sealed class ModelHttpTransportTests
             private readonly byte[] _body = Encoding.UTF8.GetBytes("{\"value\":[]}");
             private int _position;
 
+            private async Task WaitForCancellationAsync(CancellationToken cancellationToken)
+            {
+                owner.Entered.TrySetResult(true);
+                try
+                {
+                    await Task.Delay(Timeout.Infinite, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    owner.CancellationObserved.TrySetResult(true);
+                    if (owner.ResumeAfterCancellation is not null)
+                    {
+                        await owner.ResumeAfterCancellation.Task;
+                    }
+
+                    throw;
+                }
+            }
+
             public async Task<ModelHttpResponseHead> SendAsync(CancellationToken cancellationToken)
             {
                 Interlocked.Increment(ref owner.Sends);
@@ -831,8 +962,7 @@ internal sealed class ModelHttpTransportTests
 
                 if (owner.BlockSend)
                 {
-                    owner.Entered.TrySetResult(true);
-                    await Task.Delay(Timeout.Infinite, cancellationToken);
+                    await WaitForCancellationAsync(cancellationToken);
                 }
 
                 return new ModelHttpResponseHead(owner.StatusCode, new[]
@@ -857,8 +987,7 @@ internal sealed class ModelHttpTransportTests
 
                 if (owner.BlockRead)
                 {
-                    owner.Entered.TrySetResult(true);
-                    await Task.Delay(Timeout.Infinite, cancellationToken);
+                    await WaitForCancellationAsync(cancellationToken);
                 }
 
                 var count = Math.Min(3, Math.Min(buffer.Length, _body.Length - _position));
