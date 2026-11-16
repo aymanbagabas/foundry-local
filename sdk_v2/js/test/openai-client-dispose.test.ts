@@ -2,10 +2,6 @@
 // Use the chat fixture for native session-release coverage and each client's integration suite for its modality.
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { AudioClient } from "../src/openai/audioClient.js";
-import { ChatClient } from "../src/openai/chatClient.js";
-import { EmbeddingClient } from "../src/openai/embeddingClient.js";
-
 import {
   type RealModelManagerFixture,
   haveTestModelCache,
@@ -110,7 +106,7 @@ describe.skipIf(!haveTestModelCache)("OpenAI client dispose()", () => {
   describe("AudioClient (no-session dispose paths)", () => {
     it("dispose() of a never-used AudioClient is a no-op", () => {
       if (fixture === undefined) throw new Error("fixture missing");
-      const client = new AudioClient(fixture.model);
+      const client = fixture.model.createAudioClient();
       expect(client.disposed).toBe(false);
       expect(() => client.dispose()).not.toThrow();
       expect(client.disposed).toBe(true);
@@ -119,7 +115,7 @@ describe.skipIf(!haveTestModelCache)("OpenAI client dispose()", () => {
 
     it("transcribe after dispose() throws", async () => {
       if (fixture === undefined) throw new Error("fixture missing");
-      const client = new AudioClient(fixture.model);
+      const client = fixture.model.createAudioClient();
       client.dispose();
       await expect(client.transcribe("anything.wav")).rejects.toThrow(/already disposed/);
     });
@@ -128,7 +124,7 @@ describe.skipIf(!haveTestModelCache)("OpenAI client dispose()", () => {
   describe("EmbeddingClient (no-session dispose paths)", () => {
     it("dispose() of a never-used EmbeddingClient is a no-op", () => {
       if (fixture === undefined) throw new Error("fixture missing");
-      const client = new EmbeddingClient(fixture.model);
+      const client = fixture.model.createEmbeddingClient();
       expect(client.disposed).toBe(false);
       expect(() => client.dispose()).not.toThrow();
       expect(client.disposed).toBe(true);
@@ -137,7 +133,7 @@ describe.skipIf(!haveTestModelCache)("OpenAI client dispose()", () => {
 
     it("generateEmbedding after dispose() throws", async () => {
       if (fixture === undefined) throw new Error("fixture missing");
-      const client = new EmbeddingClient(fixture.model);
+      const client = fixture.model.createEmbeddingClient();
       client.dispose();
       await expect(client.generateEmbedding("hello")).rejects.toThrow(/already disposed/);
     });

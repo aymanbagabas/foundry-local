@@ -27,6 +27,8 @@ struct CatalogCtorToken {
   std::weak_ptr<foundry_local::Manager> manager_lifetime;
   std::shared_ptr<std::atomic_bool> disposed;
   Napi::ObjectReference manager;  // pins the owning Manager
+  bool model_http_transport = false;
+  bool local_catalog = false;
 };
 
 class Catalog : public Napi::ObjectWrap<Catalog> {
@@ -41,6 +43,14 @@ class Catalog : public Napi::ObjectWrap<Catalog> {
   Napi::Value GetModels(const Napi::CallbackInfo& info);
   Napi::Value GetCachedModels(const Napi::CallbackInfo& info);
   Napi::Value GetLoadedModels(const Napi::CallbackInfo& info);
+  Napi::Value GetModelsAsync(const Napi::CallbackInfo& info);
+  Napi::Value GetCachedModelsAsync(const Napi::CallbackInfo& info);
+  Napi::Value GetLoadedModelsAsync(const Napi::CallbackInfo& info);
+  Napi::Value GetModelAsync(const Napi::CallbackInfo& info);
+  Napi::Value GetModelVariantAsync(const Napi::CallbackInfo& info);
+  Napi::Value GetLatestVersionAsync(const Napi::CallbackInfo& info);
+  Napi::Value GetListAsync(const Napi::CallbackInfo& info, int kind);
+  Napi::Value GetSingleAsync(const Napi::CallbackInfo& info, int kind);
   Napi::Value GetModelVersions(const Napi::CallbackInfo& info);
   Napi::Value GetModel(const Napi::CallbackInfo& info);
   Napi::Value GetModelVariant(const Napi::CallbackInfo& info);
@@ -56,6 +66,8 @@ class Catalog : public Napi::ObjectWrap<Catalog> {
   std::weak_ptr<foundry_local::Manager> manager_lifetime_;
   std::shared_ptr<std::atomic_bool> disposed_;
   Napi::ObjectReference manager_;
+  bool model_http_transport_ = false;
+  bool remote_model_http_transport_ = false;
 };
 
 }  // namespace foundry_local_node

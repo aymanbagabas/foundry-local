@@ -23,6 +23,13 @@ For a user-facing introduction to the inference API and cross-language examples,
 
 ---
 
+## Custom model acquisition HTTP
+
+Use `FoundryLocalConfig.modelHttpTransport` with the exported `NodeModelHttpTransport` or implement the client-neutral
+`ModelHttpTransport` interface. Caller-owned HTTP/HTTPS Agents configure pooling, TLS and application routing.
+With a JS transport, obtain catalogs using `await manager.getCatalogAsync()`.
+See [transport contracts, lifecycle and the executable native loopback example](docs/model-http-transport.md).
+
 ## Native shared hosting
 
 Set `useSharedHost: true` in `FoundryLocalManager` configuration to route existing model/session APIs through the

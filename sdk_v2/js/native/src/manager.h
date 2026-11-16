@@ -33,6 +33,8 @@ class Manager : public Napi::ObjectWrap<Manager> {
 
   // Sync entry: returns a typed Catalog handle pinning this Manager.
   Napi::Value GetCatalog(const Napi::CallbackInfo& info);
+  Napi::Value GetCatalogAsync(const Napi::CallbackInfo& info);
+  Napi::Value GetCatalogImpl(const Napi::CallbackInfo& info, bool async);
 
   // Web service control. All sync — underlying C ABI calls are quick.
   Napi::Value StartWebService(const Napi::CallbackInfo& info);
@@ -58,6 +60,7 @@ class Manager : public Napi::ObjectWrap<Manager> {
 
   std::shared_ptr<foundry_local::Manager> impl_;
   std::shared_ptr<std::atomic_bool> disposed_ = std::make_shared<std::atomic_bool>(false);
+  bool model_http_transport_ = false;
 };
 
 }  // namespace foundry_local_node

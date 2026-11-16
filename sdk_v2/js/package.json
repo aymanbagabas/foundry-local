@@ -18,6 +18,8 @@
     "script/install-native.cjs",
     "deps_versions.json",
     "README.md",
+    "docs/model-http-transport.md",
+    "examples/modelHttpTransport.mjs",
     "LICENSE"
   ],
   "engines": {

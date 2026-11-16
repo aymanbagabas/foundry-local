@@ -7,11 +7,16 @@
 // by direct JS construction). Lifetime is tied to the Napi::Env.
 #pragma once
 
+#include "worker_environment.h"
+
 #include <napi.h>
+
+#include <memory>
 
 namespace foundry_local_node {
 
 struct AddonData {
+  std::shared_ptr<WorkerEnvironment> worker_environment = std::make_shared<WorkerEnvironment>();
   Napi::FunctionReference catalog_ctor;
   Napi::FunctionReference model_ctor;
   Napi::FunctionReference model_info_ctor;

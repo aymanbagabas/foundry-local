@@ -20,6 +20,7 @@
 #pragma once
 
 #include "errors.h"
+#include "environment_worker.h"
 
 #include <napi.h>
 
@@ -34,7 +35,7 @@
 namespace foundry_local_node {
 
 template <typename T>
-class PromiseWorker : public Napi::AsyncWorker {
+class PromiseWorker : public EnvironmentWorker {
  public:
   using Job = std::function<T()>;
   using Resolver = std::function<Napi::Value(Napi::Env, T&)>;
@@ -43,10 +44,11 @@ class PromiseWorker : public Napi::AsyncWorker {
   static Napi::Promise Run(Napi::Env env, Job job, Resolver resolver,
                            Napi::ObjectReference owner = Napi::ObjectReference(),
                            CompletionCheck completion_check = CompletionCheck()) {
-    auto* w = new PromiseWorker(env, std::move(job), std::move(resolver), std::move(owner),
-                                std::move(completion_check));
+    auto w = std::unique_ptr<PromiseWorker>(
+        new PromiseWorker(env, std::move(job), std::move(resolver), std::move(owner), std::move(completion_check)));
     Napi::Promise p = w->deferred_.Promise();
     w->Queue();
+    w.release();
     return p;
   }
 
@@ -98,7 +100,7 @@ class PromiseWorker : public Napi::AsyncWorker {
  private:
   PromiseWorker(Napi::Env env, Job job, Resolver resolver, Napi::ObjectReference owner,
                 CompletionCheck completion_check)
-      : Napi::AsyncWorker(env),
+      : EnvironmentWorker(env),
         deferred_(Napi::Promise::Deferred::New(env)),
         job_(std::move(job)),
         resolver_(std::move(resolver)),
@@ -119,7 +121,7 @@ class PromiseWorker : public Napi::AsyncWorker {
 /// Void specialization: runs a std::function<void()> on a worker thread and
 /// resolves the Promise with `undefined` on success. Error tagging matches
 /// PromiseWorker<T>.
-class PromiseWorkerVoid : public Napi::AsyncWorker {
+class PromiseWorkerVoid : public EnvironmentWorker {
  public:
   using Job = std::function<void()>;
   using Completion = std::function<void()>;
@@ -127,9 +129,11 @@ class PromiseWorkerVoid : public Napi::AsyncWorker {
   static Napi::Promise Run(Napi::Env env, Job job,
                            Napi::ObjectReference owner = Napi::ObjectReference(),
                            Completion completion = Completion()) {
-    auto* w = new PromiseWorkerVoid(env, std::move(job), std::move(owner), std::move(completion));
+    auto w = std::unique_ptr<PromiseWorkerVoid>(
+        new PromiseWorkerVoid(env, std::move(job), std::move(owner), std::move(completion)));
     Napi::Promise p = w->deferred_.Promise();
     w->Queue();
+    w.release();
     return p;
   }
 
@@ -169,8 +173,13 @@ class PromiseWorkerVoid : public Napi::AsyncWorker {
   }
 
  private:
+  void OnShutdown() override {
+    // Completion releases native resources (e.g. progress TSFNs); it must not invoke JavaScript.
+    if (completion_) completion_();
+  }
+
   PromiseWorkerVoid(Napi::Env env, Job job, Napi::ObjectReference owner, Completion completion)
-      : Napi::AsyncWorker(env),
+      : EnvironmentWorker(env),
         deferred_(Napi::Promise::Deferred::New(env)),
         job_(std::move(job)),
         owner_(std::move(owner)),

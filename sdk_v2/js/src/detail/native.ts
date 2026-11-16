@@ -7,6 +7,31 @@ import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+export type NativeModelHttpRequest = {
+  readonly method: "GET" | "HEAD" | "POST";
+  readonly url: string;
+  readonly headers: readonly (readonly [string, Uint8Array])[];
+  readonly body: Uint8Array;
+  readonly timeoutMs: number;
+};
+
+export type NativeModelHttpResponseHead = {
+  readonly statusCode: number;
+  readonly headers: readonly (readonly [string, Uint8Array])[];
+};
+
+export type NativeModelHttpTransportEvent =
+  | { readonly type: "create"; readonly operationId: number; readonly request: NativeModelHttpRequest }
+  | { readonly type: "send"; readonly operationId: number }
+  | { readonly type: "read"; readonly operationId: number; readonly capacity: number }
+  | { readonly type: "cancel"; readonly operationId: number }
+  | { readonly type: "close"; readonly operationId: number };
+
+export type NativeModelHttpTransportResult = NativeModelHttpResponseHead | Uint8Array | undefined;
+export type NativeModelHttpTransportCallback = (
+  event: NativeModelHttpTransportEvent,
+) => Promise<NativeModelHttpTransportResult> | undefined;
+
 // JSON-stringifiable shape of the addon's `Manager` class. The native side
 // uses `Napi::ObjectWrap<Manager>` and exports a JS constructor.
 export interface NativeManagerCtor {
@@ -20,12 +45,18 @@ export interface NativeManagerCtor {
     logLevel?: "trace" | "debug" | "info" | "warn" | "error" | "fatal";
     webServiceUrls?: string;
     additionalSettings?: { [key: string]: string };
+    modelHttpTransportCallback?: NativeModelHttpTransportCallback;
   }): NativeManager;
 }
 
 export interface NativeManager {
   getWebServiceEndpoints(): string[];
   getCatalog(type?: 0 | 1 | 2, options?: Readonly<Record<string, string>>): NativeCatalog;
+  getCatalogAsync(
+    type?: 0 | 1 | 2,
+    options?: Readonly<Record<string, string>>,
+    onWorkerStarted?: () => void,
+  ): Promise<NativeCatalog>;
   startWebService(): void;
   stopWebService(): void;
   discoverEps(): Array<{ name: string; isRegistered: boolean }>;
@@ -129,10 +160,21 @@ export interface NativeCatalog {
   getModels(): NativeModel[];
   getCachedModels(): NativeModel[];
   getLoadedModels(): NativeModel[];
+  getModelsAsync(onWorkerStarted?: () => void): Promise<NativeModel[]>;
+  getCachedModelsAsync(onWorkerStarted?: () => void): Promise<NativeModel[]>;
+  getLoadedModelsAsync(onWorkerStarted?: () => void): Promise<NativeModel[]>;
   getModel(alias: string): NativeModel | undefined;
   getModelVariant(modelId: string): NativeModel | undefined;
   getLatestVersion(model: NativeModel): NativeModel | undefined;
-  getModelVersions(modelAlias: string, modelName: string | null, maxVersions: number): Promise<NativeModel[]>;
+  getModelAsync(alias: string, onWorkerStarted?: () => void): Promise<NativeModel | undefined>;
+  getModelVariantAsync(modelId: string, onWorkerStarted?: () => void): Promise<NativeModel | undefined>;
+  getLatestVersionAsync(model: NativeModel, onWorkerStarted?: () => void): Promise<NativeModel | undefined>;
+  getModelVersions(
+    modelAlias: string,
+    modelName: string | null,
+    maxVersions: number,
+    onWorkerStarted?: () => void,
+  ): Promise<NativeModel[]>;
   registerModel(
     modelPath: string,
     modelId: string,

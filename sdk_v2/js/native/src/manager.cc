@@ -6,6 +6,8 @@
 #include "catalog.h"
 #include "errors.h"
 #include "promise_worker.h"
+#include "model_http_transport.h"
+#include "worker_start_gate.h"
 
 #include <foundry_local/foundry_local_c.h>
 #include <foundry_local/foundry_local_cpp.h>
@@ -40,6 +42,7 @@ Napi::Function Manager::Init(Napi::Env env) {
                      {
                          InstanceMethod("getWebServiceEndpoints", &Manager::GetWebServiceEndpoints),
                          InstanceMethod("getCatalog", &Manager::GetCatalog),
+                         InstanceMethod("getCatalogAsync", &Manager::GetCatalogAsync),
                          InstanceMethod("startWebService", &Manager::StartWebService),
                          InstanceMethod("stopWebService", &Manager::StopWebService),
                          InstanceMethod("discoverEps", &Manager::DiscoverEps),
@@ -186,8 +189,18 @@ Manager::Manager(const Napi::CallbackInfo& info) : Napi::ObjectWrap<Manager>(inf
     has_log_level = true;
   }
 
+  auto transport_callback = opts.Get("modelHttpTransportCallback");
+  if (!transport_callback.IsUndefined() && !transport_callback.IsFunction()) {
+    Napi::TypeError::New(env, "options.modelHttpTransportCallback must be a function").ThrowAsJavaScriptException();
+    return;
+  }
+  model_http_transport_ = transport_callback.IsFunction();
+
   CallCheckedVoid(env, [&]() {
     foundry_local::Configuration config(app_name);
+    if (model_http_transport_) {
+      SetModelHttpTransport(env, config, transport_callback.As<Napi::Function>());
+    }
     if (has_model_cache_dir) {
       config.SetModelCacheDir(model_cache_dir);
     }
@@ -247,10 +260,19 @@ Napi::Value Manager::GetWebServiceEndpoints(const Napi::CallbackInfo& info) {
 }
 
 Napi::Value Manager::GetCatalog(const Napi::CallbackInfo& info) {
+  return GetCatalogImpl(info, false);
+}
+
+Napi::Value Manager::GetCatalogAsync(const Napi::CallbackInfo& info) {
+  return GetCatalogImpl(info, true);
+}
+
+Napi::Value Manager::GetCatalogImpl(const Napi::CallbackInfo& info, bool async) {
   Napi::Env env = info.Env();
   if (ThrowIfDisposed(env)) {
     return env.Undefined();
   }
+  if (!async && RejectSyncModelHttpTransport(env, model_http_transport_)) return env.Undefined();
   flCatalogType type = FOUNDRY_LOCAL_CATALOG_PUBLIC;
   if (info.Length() >= 1 && !info[0].IsUndefined()) {
     if (!info[0].IsNumber()) {
@@ -268,13 +290,17 @@ Napi::Value Manager::GetCatalog(const Napi::CallbackInfo& info) {
     type = static_cast<flCatalogType>(value);
   }
   Napi::ObjectReference owner = Napi::Reference<Napi::Object>::New(info.This().As<Napi::Object>(), 1);
+  auto worker_start_gate = async ? ReadWorkerStartGate(info, 2, "Manager.getCatalogAsync.workerStarted", "manager")
+                                 : nullptr;
+  if (env.IsExceptionPending()) return env.Undefined();
   return CallChecked<Napi::Value>(env, [&]() -> Napi::Value {
-    foundry_local::ICatalog* catalog;
+    auto options = std::make_shared<std::vector<std::pair<std::string, std::string>>>();
+    bool has_options = false;
     if (info.Length() >= 2 && !info[1].IsUndefined()) {
+      has_options = true;
       if (!info[1].IsObject() || info[1].IsNull() || info[1].IsArray()) {
         throw std::invalid_argument("getCatalog: options must be an object of strings");
       }
-      foundry_local::KeyValuePairs options;
       auto object = info[1].As<Napi::Object>();
       auto keys = object.GetPropertyNames();
       for (uint32_t i = 0; i < keys.Length(); ++i) {
@@ -287,18 +313,43 @@ Napi::Value Manager::GetCatalog(const Napi::CallbackInfo& info) {
         if (text.find('\0') != std::string::npos) {
           throw std::invalid_argument("getCatalog: option values cannot contain null characters");
         }
-        options.Set(key.c_str(), text.c_str());
+        options->emplace_back(std::move(key), std::move(text));
       }
-      catalog = &impl_->GetCatalog(type, options);
-    } else {
-      catalog = &impl_->GetCatalog(type);
     }
-    CatalogCtorToken token;
-    token.catalog = catalog;
-    token.manager_lifetime = impl_;
-    token.disposed = disposed_;
-    token.manager = std::move(owner);
-    return Catalog::NewInstance(env, std::move(token));
+    auto manager = impl_;
+    auto get_catalog = [manager, type, options, has_options, worker_start_gate]() -> foundry_local::ICatalog* {
+      if (worker_start_gate) worker_start_gate->SignalAndWait();
+      if (!has_options) return &manager->GetCatalog(type);
+      foundry_local::KeyValuePairs values;
+      for (const auto& entry : *options) values.Set(entry.first.c_str(), entry.second.c_str());
+      return &manager->GetCatalog(type, values);
+    };
+    auto pin = std::make_shared<Napi::ObjectReference>(std::move(owner));
+    auto weak = std::weak_ptr<foundry_local::Manager>(manager);
+    auto disposed = disposed_;
+    const bool transport = model_http_transport_;
+    auto convert = [pin, weak, disposed, transport, type](Napi::Env env, foundry_local::ICatalog*& catalog) -> Napi::Value {
+      CatalogCtorToken token;
+      token.catalog = catalog;
+      token.manager_lifetime = weak;
+      token.disposed = disposed;
+      token.model_http_transport = transport;
+      token.local_catalog = type == FOUNDRY_LOCAL_CATALOG_LOCAL;
+      token.manager = Napi::Reference<Napi::Object>::New(pin->Value(), 1);
+      return Catalog::NewInstance(env, std::move(token));
+    };
+    if (async) {
+      auto check = [disposed]() {
+        if (disposed->load()) {
+          throw foundry_local::Error("Manager has been disposed", FOUNDRY_LOCAL_ERROR_INVALID_USAGE);
+        }
+      };
+      auto owner_pin = Napi::Reference<Napi::Object>::New(info.This().As<Napi::Object>(), 1);
+      return PromiseWorker<foundry_local::ICatalog*>::Run(
+          env, std::move(get_catalog), std::move(convert), std::move(owner_pin), std::move(check));
+    }
+    auto* catalog = get_catalog();
+    return convert(env, catalog);
   });
 }
 
@@ -317,6 +368,8 @@ Napi::Value Manager::IsDisposed(const Napi::CallbackInfo& info) {
 
 Napi::Value Manager::StartWebService(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  // Service stop/shutdown joins handlers. Do not admit a sync-controlled server whose handlers can wait on JS HTTP.
+  if (RejectSyncModelHttpTransport(env, model_http_transport_)) return env.Undefined();
   if (ThrowIfDisposed(env)) {
     return env.Undefined();
   }
@@ -328,6 +381,7 @@ Napi::Value Manager::StartWebService(const Napi::CallbackInfo& info) {
 
 Napi::Value Manager::StopWebService(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (RejectSyncModelHttpTransport(env, model_http_transport_)) return env.Undefined();
   if (ThrowIfDisposed(env)) {
     return env.Undefined();
   }
@@ -430,18 +484,21 @@ Napi::Value Manager::DownloadAndRegisterEps(const Napi::CallbackInfo& info) {
 
   Napi::ObjectReference owner = Napi::Reference<Napi::Object>::New(info.This().As<Napi::Object>(), 1);
   auto progress = std::make_shared<Napi::ThreadSafeFunction>(std::move(tsfn));
+  auto environment = env.GetInstanceData<AddonData>()->worker_environment;
   auto manager = impl_;
   return PromiseWorkerVoid::Run(
       env,
-      [manager, ep_names = std::move(ep_names), progress, emit_test_progress]() {
+      [manager, ep_names = std::move(ep_names), progress, environment, emit_test_progress]() {
         std::function<bool(std::string_view, float)> progress_callback;
         if (*progress) {
-          progress_callback = [progress, emit_test_progress](std::string_view ep_name, float percent) {
+          progress_callback = [progress, environment, emit_test_progress](std::string_view ep_name, float percent) {
+            if (environment->closing.load(std::memory_order_acquire)) return false;
             std::string name(ep_name);
             auto acknowledgement = emit_test_progress ? std::make_shared<ProgressAcknowledgement>() : nullptr;
-            progress->BlockingCall([name, percent, acknowledgement](Napi::Env env, Napi::Function callback) {
+            progress->BlockingCall([name, percent, acknowledgement, environment](Napi::Env env, Napi::Function callback) {
               std::optional<AcknowledgeProgressOnExit> acknowledge;
               if (acknowledgement != nullptr) acknowledge.emplace(acknowledgement);
+              if (env == nullptr || environment->CheckClosing()) return;
               callback.Call({Napi::String::New(env, name), Napi::Number::New(env, static_cast<double>(percent))});
             });
             if (acknowledgement != nullptr) {
@@ -458,11 +515,11 @@ Napi::Value Manager::DownloadAndRegisterEps(const Napi::CallbackInfo& info) {
         manager->DownloadAndRegisterEps(ep_names, std::move(progress_callback));
       },
       std::move(owner), [progress]() {
-        if (*progress) {
-          progress->Release();
-          *progress = Napi::ThreadSafeFunction();
-        }
-      });
+        auto& current = *progress;
+        if (current) {
+          current.Release();
+          current = Napi::ThreadSafeFunction();
+        } });
 }
 
 Napi::Value Manager::IsEpDownloadInProgress(const Napi::CallbackInfo& info) {
@@ -477,6 +534,7 @@ Napi::Value Manager::IsEpDownloadInProgress(const Napi::CallbackInfo& info) {
 
 Napi::Value Manager::Shutdown(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  if (RejectSyncModelHttpTransport(env, model_http_transport_)) return env.Undefined();
   if (ThrowIfDisposed(env)) {
     return env.Undefined();
   }

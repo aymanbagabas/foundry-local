@@ -26,6 +26,12 @@ import { CatalogType } from "../src/types.js";
 function fakeCatalog(name: string): NativeCatalog {
   return {
     getName: () => name,
+    getModelsAsync: async () => [],
+    getCachedModelsAsync: async () => [],
+    getLoadedModelsAsync: async () => [],
+    getModelAsync: async () => undefined,
+    getModelVariantAsync: async () => undefined,
+    getLatestVersionAsync: async () => undefined,
     getModels: () => [],
     getCachedModels: () => [],
     getLoadedModels: () => [],

@@ -4,8 +4,10 @@
 
 #include "addon_data.h"
 #include "errors.h"
+#include "environment_worker.h"
 #include "items.h"
 #include "model.h"
+#include "model_http_transport.h"
 #include "request.h"
 #include "request_options.h"
 
@@ -223,7 +225,7 @@ std::shared_ptr<QueuedCancellation> AttachQueuedCancellation(
 // Process a Request on a worker thread, converting to JS after completion. Chat/audio workers are queued by their
 // per-session scheduler before consuming a libuv worker; embeddings workers start immediately.
 template <typename SessT>
-class SessionPromiseWorker : public Napi::AsyncWorker {
+class SessionPromiseWorker : public EnvironmentWorker {
  public:
   using Result = std::shared_ptr<foundry_local::Response>;
 
@@ -326,7 +328,7 @@ class SessionPromiseWorker : public Napi::AsyncWorker {
                        std::shared_ptr<SessionScheduler> scheduler,
                        std::shared_ptr<SessionActivity> activity,
                        std::shared_ptr<SessionWorkerGate> worker_gate)
-      : Napi::AsyncWorker(env),
+      : EnvironmentWorker(env),
         deferred_(Napi::Promise::Deferred::New(env)),
         sess_(std::move(sess)),
         req_(req),
@@ -338,6 +340,11 @@ class SessionPromiseWorker : public Napi::AsyncWorker {
         worker_gate_(std::move(worker_gate)) {}
 
   void Start() {
+    if (EnvironmentClosing()) {
+      OnShutdown();
+      delete this;
+      return;
+    }
     try {
       Queue();
     } catch (const std::exception& e) {
@@ -359,6 +366,11 @@ class SessionPromiseWorker : public Napi::AsyncWorker {
       auto scheduler = std::move(scheduler_);
       scheduler->Complete();
     }
+  }
+
+  void OnShutdown() override {
+    CompleteScheduler();
+    CompleteActivity();
   }
 
   void CompleteActivity() {
@@ -402,7 +414,7 @@ class SessionPromiseWorker : public Napi::AsyncWorker {
   bool activity_completed_ = false;
 };
 
-class RequestPreflightWorker : public Napi::AsyncWorker {
+class RequestPreflightWorker : public EnvironmentWorker {
  public:
   static Napi::Promise Run(Napi::Env env, std::shared_ptr<foundry_local::RequestPreflight> preflight,
                            std::shared_ptr<foundry_local::Manager> manager_lifetime,
@@ -470,7 +482,7 @@ class RequestPreflightWorker : public Napi::AsyncWorker {
   RequestPreflightWorker(Napi::Env env, std::shared_ptr<foundry_local::RequestPreflight> preflight,
                          std::shared_ptr<foundry_local::Manager> manager_lifetime,
                          Napi::ObjectReference manager)
-      : Napi::AsyncWorker(env),
+      : EnvironmentWorker(env),
         deferred_(Napi::Promise::Deferred::New(env)),
         preflight_(std::move(preflight)),
         manager_lifetime_(std::move(manager_lifetime)),
@@ -544,6 +556,7 @@ struct StreamCtx {
   int err_code = 0;
   bool tagged = false;
   bool errored = false;
+  std::shared_ptr<WorkerEnvironment> environment;
 };
 
 class StreamFinalizeGuard {
@@ -564,6 +577,7 @@ class StreamFinalizeGuard {
 
 void FinalizeStream(Napi::Env env, void* /*data*/, StreamCtx* ctx) {
   StreamFinalizeGuard finalize_guard(ctx);
+  if (env == nullptr || ctx->environment->CheckClosing()) return;
   Napi::HandleScope scope(env);
   try {
     if (ctx->errored) {
@@ -593,7 +607,7 @@ void FinalizeStream(Napi::Env env, void* /*data*/, StreamCtx* ctx) {
 }
 
 template <typename SessT>
-class StreamWorker : public Napi::AsyncWorker {
+class StreamWorker : public EnvironmentWorker {
  public:
   static Napi::Promise Run(Napi::Env env, std::shared_ptr<SessT> sess, foundry_local::Request* req,
                            Napi::Function jsCallback, StreamCtx* ctx,
@@ -655,10 +669,12 @@ class StreamWorker : public Napi::AsyncWorker {
         (void)ctx;
         auto* streamed_item = new foundry_local::Item(std::move(item));
         napi_status status = tsfn.BlockingCall(
-            streamed_item, [](Napi::Env env, Napi::Function jsCb, foundry_local::Item* item) {
+            streamed_item, [environment = ctx->environment](Napi::Env env, Napi::Function jsCb,
+                                                            foundry_local::Item* item) {
+              std::unique_ptr<foundry_local::Item> owned_item(item);
+              if (env == nullptr || environment->CheckClosing()) return;
               Napi::HandleScope scope(env);
               Napi::Value js_item = ItemToJs(env, *item);
-              delete item;
               jsCb.Call({js_item});
             });
         if (status != napi_ok) {
@@ -717,7 +733,7 @@ class StreamWorker : public Napi::AsyncWorker {
   StreamWorker(Napi::Env env, std::shared_ptr<SessT> sess, foundry_local::Request* req,
                Napi::Function jsCallback, StreamCtx* ctx, std::shared_ptr<SessionScheduler> scheduler,
                std::shared_ptr<QueuedCancellation> queued_cancellation)
-      : Napi::AsyncWorker(env),
+      : EnvironmentWorker(env),
         sess_(std::move(sess)),
         req_(req),
         ctx_(ctx),
@@ -729,6 +745,11 @@ class StreamWorker : public Napi::AsyncWorker {
                                             static_cast<void*>(nullptr))) {}
 
   void Start() {
+    if (EnvironmentClosing()) {
+      OnShutdown();
+      delete this;
+      return;
+    }
     try {
       Queue();
     } catch (const std::exception& e) {
@@ -750,6 +771,8 @@ class StreamWorker : public Napi::AsyncWorker {
       tsfn_.Release();
     }
   }
+
+  void OnShutdown() override { ReleaseTsfn(); }
 
   void FailBeforeQueue(const std::string& message) {
     scheduler_.reset();
@@ -804,7 +827,8 @@ Napi::Value ProcessStreamingRequestOn(Napi::Env env, std::shared_ptr<SessT> sess
                             "",
                             0,
                             false,
-                            false};
+                            false,
+                            env.GetInstanceData<AddonData>()->worker_environment};
   return StreamWorker<SessT>::Run(env, std::move(sess), req, info[1].As<Napi::Function>(), ctx,
                                   std::move(scheduler));
 }
@@ -849,6 +873,8 @@ GenericSession::GenericSession(const Napi::CallbackInfo& info)
   auto manager_lifetime = model->LockManager(env);
   if (manager_lifetime == nullptr) return;
   try {
+    if (model->model_http_transport() && model->MayResolveDefaultVariant() &&
+        RejectSyncModelHttpTransport(env, true)) return;
     impl_ = std::make_shared<foundry_local::Session>(*native);
   } catch (const foundry_local::Error& e) {
     ThrowFoundryLocalError(env, static_cast<int>(e.Code()), e.what());
@@ -970,6 +996,8 @@ ChatSession::ChatSession(const Napi::CallbackInfo& info)
   auto manager_lifetime = model->LockManager(env);
   if (manager_lifetime == nullptr) return;
   try {
+    if (model->model_http_transport() && model->MayResolveDefaultVariant() &&
+        RejectSyncModelHttpTransport(env, true)) return;
     impl_ = std::make_shared<foundry_local::ChatSession>(*native);
   } catch (const foundry_local::Error& e) {
     ThrowFoundryLocalError(env, static_cast<int>(e.Code()), e.what());
@@ -1219,6 +1247,8 @@ EmbeddingsSession::EmbeddingsSession(const Napi::CallbackInfo& info)
   auto manager_lifetime = model->LockManager(env);
   if (manager_lifetime == nullptr) return;
   try {
+    if (model->model_http_transport() && model->MayResolveDefaultVariant() &&
+        RejectSyncModelHttpTransport(env, true)) return;
     impl_ = std::make_shared<foundry_local::EmbeddingsSession>(*native);
   } catch (const foundry_local::Error& e) {
     ThrowFoundryLocalError(env, static_cast<int>(e.Code()), e.what());
@@ -1339,6 +1369,8 @@ AudioSession::AudioSession(const Napi::CallbackInfo& info)
   auto manager_lifetime = model->LockManager(env);
   if (manager_lifetime == nullptr) return;
   try {
+    if (model->model_http_transport() && model->MayResolveDefaultVariant() &&
+        RejectSyncModelHttpTransport(env, true)) return;
     impl_ = std::make_shared<foundry_local::AudioSession>(*native);
   } catch (const foundry_local::Error& e) {
     ThrowFoundryLocalError(env, static_cast<int>(e.Code()), e.what());

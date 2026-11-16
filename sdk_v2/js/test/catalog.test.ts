@@ -117,6 +117,8 @@ describeIfBuilt("Catalog (cache-only)", () => {
     };
     const fakeNativeModel: NativeModel = {
       getInfo: () => nativeModelInfo,
+      getStringProperty: () => undefined,
+      getIntProperty: (_key, defaultValue = 0) => defaultValue,
       isCached: () => true,
       isLoaded: () => false,
       getPath: () => "",
@@ -129,6 +131,12 @@ describeIfBuilt("Catalog (cache-only)", () => {
     };
     const fakeNativeCatalog: NativeCatalog = {
       getName: () => "TestCatalog",
+      getModelsAsync: async () => [],
+      getCachedModelsAsync: async () => [],
+      getLoadedModelsAsync: async () => [],
+      getModelAsync: async () => undefined,
+      getModelVariantAsync: async () => undefined,
+      getLatestVersionAsync: async () => undefined,
       getModels: () => [],
       getCachedModels: () => [],
       getLoadedModels: () => [],
@@ -166,6 +174,12 @@ describe("Catalog.getModelVersions maxVersions validation", () => {
   function makeGuardedCatalog(): Catalog {
     const fakeNativeCatalog: NativeCatalog = {
       getName: () => "TestCatalog",
+      getModelsAsync: async () => [],
+      getCachedModelsAsync: async () => [],
+      getLoadedModelsAsync: async () => [],
+      getModelAsync: async () => undefined,
+      getModelVariantAsync: async () => undefined,
+      getLatestVersionAsync: async () => undefined,
       getModels: () => [],
       getCachedModels: () => [],
       getLoadedModels: () => [],
@@ -216,6 +230,12 @@ describe("Catalog.getModelVersions maxVersions validation", () => {
     it(`accepts ${label} (${value})`, async () => {
       const fakeNativeCatalog: NativeCatalog = {
         getName: () => "TestCatalog",
+        getModelsAsync: async () => [],
+        getCachedModelsAsync: async () => [],
+        getLoadedModelsAsync: async () => [],
+        getModelAsync: async () => undefined,
+        getModelVariantAsync: async () => undefined,
+        getLatestVersionAsync: async () => undefined,
         getModels: () => [],
         getCachedModels: () => [],
         getLoadedModels: () => [],

@@ -7,6 +7,7 @@ import { readFileSync } from "node:fs";
 
 import { type Catalog, wrapNativeCatalog } from "./catalog.js";
 import { FOUNDRY_LOCAL_CONFIG_KEYS, type FoundryLocalConfig } from "./configuration.js";
+import { createModelHttpTransportCallback } from "./detail/modelHttpTransport.js";
 import { type NativeManager, configureNativeLoader, getAddon, getPreloadedLibraryPath } from "./detail/native.js";
 
 import { CatalogType, type EpDownloadResult, type EpInfo } from "./types.js";
@@ -60,6 +61,8 @@ function installExitHandlersOnce(): void {
 export class FoundryLocalManager {
   readonly #native: NativeManager;
   readonly #catalogs = new Map<string, Catalog>();
+  readonly #catalogRequests = new Map<string, Promise<Catalog>>();
+  readonly #hasModelHttpTransport: boolean;
 
   constructor(config: FoundryLocalConfig) {
     if (config === null || config === undefined) {
@@ -113,7 +116,13 @@ export class FoundryLocalManager {
       UserAgent: `foundry-local-js/${SDK_VERSION}`,
       ...config.additionalSettings,
     };
-    this.#native = new (getAddon().Manager)({ ...config, additionalSettings });
+    const { modelHttpTransport, ...nativeConfig } = config;
+    this.#hasModelHttpTransport = modelHttpTransport !== undefined;
+    const transportOptions =
+      modelHttpTransport === undefined
+        ? {}
+        : { modelHttpTransportCallback: createModelHttpTransportCallback(modelHttpTransport) };
+    this.#native = new (getAddon().Manager)({ ...nativeConfig, additionalSettings, ...transportOptions });
     liveManager = this;
     installExitHandlersOnce();
   }
@@ -134,36 +143,55 @@ export class FoundryLocalManager {
     return Promise.resolve(new FoundryLocalManager(config));
   }
 
-  /** The model catalog. Lazily wraps the native handle and is cached. */
+  /** Synchronous catalog access blocks the event loop. With a JS transport, use getCatalogAsync() instead. */
   get catalog(): Catalog {
     return this.getCatalog();
   }
 
-  /** Select a catalog. AzureRegistry requires a `name` and optionally a `credential` option. */
+  /**
+   * Select a catalog synchronously (blocks the event loop). Rejects when a JS HTTP transport is configured; prefer
+   * getCatalogAsync(). AzureRegistry requires a `name` and optionally a `credential` option.
+   */
   getCatalog(type: CatalogType = CatalogType.Public, options?: Readonly<Record<string, string>>): Catalog {
-    if (type !== CatalogType.Public && type !== CatalogType.Local && type !== CatalogType.AzureRegistry) {
-      throw new TypeError("Catalog type must be CatalogType.Public, CatalogType.Local, or CatalogType.AzureRegistry.");
+    if (this.#hasModelHttpTransport) {
+      throw Object.assign(new Error("JavaScript model HTTP transports require getCatalogAsync()"), {
+        name: "FoundryLocalError",
+        code: 4,
+      });
     }
-    if (options !== undefined && (options === null || typeof options !== "object" || Array.isArray(options))) {
-      throw new TypeError("Catalog options must be an object of strings.");
-    }
-    const entries = Object.entries(options ?? {}).sort(([a], [b]) => a.localeCompare(b));
-    for (const [key, value] of entries) {
-      if (key.length === 0 || key.includes("\0") || typeof value !== "string" || value.includes("\0")) {
-        throw new TypeError("Catalog options must have nonempty keys and string values without null characters.");
-      }
-    }
-    const key = JSON.stringify([type, entries]);
+    const { key, values } = catalogOptions(type, options);
     let catalog = this.#catalogs.get(key);
     if (catalog === undefined) {
       catalog = wrapNativeCatalog(
-        entries.length === 0 && type !== CatalogType.AzureRegistry
-          ? this.#native.getCatalog(type)
-          : this.#native.getCatalog(type, Object.fromEntries(entries)),
+        values === undefined ? this.#native.getCatalog(type) : this.#native.getCatalog(type, values),
       );
       this.#catalogs.set(key, catalog);
     }
     return catalog;
+  }
+
+  /** Select a catalog on a native worker. Required when modelHttpTransport is configured. */
+  async getCatalogAsync(
+    type: CatalogType = CatalogType.Public,
+    options?: Readonly<Record<string, string>>,
+  ): Promise<Catalog> {
+    const { key, values } = catalogOptions(type, options);
+    const cached = this.#catalogs.get(key);
+    if (cached !== undefined) return cached;
+    let pending = this.#catalogRequests.get(key);
+    if (pending === undefined) {
+      pending = this.#native.getCatalogAsync(type, values).then((native) => {
+        const catalog = wrapNativeCatalog(native);
+        this.#catalogs.set(key, catalog);
+        return catalog;
+      });
+      this.#catalogRequests.set(key, pending);
+    }
+    try {
+      return await pending;
+    } finally {
+      this.#catalogRequests.delete(key);
+    }
   }
 
   /** Observe native listening URLs without starting the service or acquiring shared-host ownership. */
@@ -269,4 +297,26 @@ export class FoundryLocalManager {
   [Symbol.dispose](): void {
     this.dispose();
   }
+}
+
+function catalogOptions(
+  type: CatalogType,
+  options: Readonly<Record<string, string>> | undefined,
+): { key: string; values: Record<string, string> | undefined } {
+  if (type !== CatalogType.Public && type !== CatalogType.Local && type !== CatalogType.AzureRegistry) {
+    throw new TypeError("Catalog type must be CatalogType.Public, CatalogType.Local, or CatalogType.AzureRegistry.");
+  }
+  if (options !== undefined && (options === null || typeof options !== "object" || Array.isArray(options))) {
+    throw new TypeError("Catalog options must be an object of strings.");
+  }
+  const entries = Object.entries(options ?? {}).sort(([a], [b]) => a.localeCompare(b));
+  for (const [key, value] of entries) {
+    if (key.length === 0 || key.includes("\0") || typeof value !== "string" || value.includes("\0")) {
+      throw new TypeError("Catalog options must have nonempty keys and string values without null characters.");
+    }
+  }
+  return {
+    key: JSON.stringify([type, entries]),
+    values: entries.length === 0 && type !== CatalogType.AzureRegistry ? undefined : Object.fromEntries(entries),
+  };
 }

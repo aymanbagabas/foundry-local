@@ -2,8 +2,7 @@
 // `FoundryLocalManager.catalog`. The underlying native catalog is owned by the parent manager; the JS wrapper
 // holds a reference to keep the manager alive while the catalog is reachable.
 //
-// The underlying native catalog operations are synchronous; the async surface here is for parity with the C# /
-// Python SDKs. `getModel`, `getModelVariant`, and `getLatestVersion` throw when the alias / id is not found.
+// Network-capable catalog operations run on native workers. Lookups throw when the alias / id is not found.
 
 import type { NativeCatalog, NativeModel } from "./detail/native.js";
 import type { IModel } from "./imodel.js";
@@ -32,17 +31,17 @@ export class Catalog {
 
   /** All models in the catalog. */
   async getModels(): Promise<IModel[]> {
-    return wrapAll(this.#native.getModels());
+    return wrapAll(await this.#native.getModelsAsync());
   }
 
   /** Every individual model variant currently present in the local cache. */
   async getCachedModels(): Promise<IModel[]> {
-    return wrapAll(this.#native.getCachedModels());
+    return wrapAll(await this.#native.getCachedModelsAsync());
   }
 
   /** Models currently loaded into memory. */
   async getLoadedModels(): Promise<IModel[]> {
-    return wrapAll(this.#native.getLoadedModels());
+    return wrapAll(await this.#native.getLoadedModelsAsync());
   }
 
   /**
@@ -51,7 +50,7 @@ export class Catalog {
    */
   async getModel(alias: string): Promise<IModel> {
     validateNonEmptyString(alias, "Model alias");
-    const n = this.#native.getModel(alias);
+    const n = await this.#native.getModelAsync(alias);
     if (n === undefined) {
       throw new Error(`Model with alias '${alias}' not found.`);
     }
@@ -61,7 +60,7 @@ export class Catalog {
   /** Look up a specific model variant by its full model id. Throws when not found. */
   async getModelVariant(modelId: string): Promise<IModel> {
     validateNonEmptyString(modelId, "Model ID");
-    const n = this.#native.getModelVariant(modelId);
+    const n = await this.#native.getModelVariantAsync(modelId);
     if (n === undefined) {
       throw new Error(`Model variant with ID '${modelId}' not found.`);
     }
@@ -73,7 +72,7 @@ export class Catalog {
     if (!(model instanceof Model)) {
       throw new TypeError("Catalog.getLatestVersion: expected a Model instance");
     }
-    const n = this.#native.getLatestVersion(unwrapNativeModel(model));
+    const n = await this.#native.getLatestVersionAsync(unwrapNativeModel(model));
     if (n === undefined) {
       throw new Error(`Latest version for model '${model.alias}' not found.`);
     }

@@ -1,5 +1,7 @@
 // Configuration shape for FoundryLocalManager.
 
+import type { ModelHttpTransport } from "./modelHttpTransport.js";
+
 export interface FoundryLocalConfig {
   /** **REQUIRED** Application name. Used to namespace SDK data on disk. */
   appName: string;
@@ -28,6 +30,9 @@ export interface FoundryLocalConfig {
    * Cannot be combined with serviceEndpoint.
    */
   useSharedHost?: boolean;
+
+  /** Override model acquisition HTTP. Requires API 5; use getCatalogAsync() and asynchronous catalog methods. */
+  modelHttpTransport?: ModelHttpTransport;
 
   /** Disable non-essential telemetry. Foundry Local may still send a minimal ProcessInfo event. Defaults to false. */
   disableNonessentialTelemetry?: boolean;
@@ -59,6 +64,7 @@ export const FOUNDRY_LOCAL_CONFIG_KEYS: ReadonlySet<keyof FoundryLocalConfig> = 
   "webServiceUrls",
   "serviceEndpoint",
   "useSharedHost",
+  "modelHttpTransport",
   "disableNonessentialTelemetry",
   "libraryPath",
   "additionalSettings",

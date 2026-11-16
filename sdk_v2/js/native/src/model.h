@@ -45,6 +45,7 @@ struct ModelCtorToken {
   std::shared_ptr<std::atomic_bool> disposed;
   // Pins the parent Manager JavaScript object for wrapper reachability.
   Napi::ObjectReference manager;
+  bool model_http_transport = false;
 };
 
 class Model : public Napi::ObjectWrap<Model> {
@@ -66,6 +67,8 @@ class Model : public Napi::ObjectWrap<Model> {
   std::shared_ptr<foundry_local::Manager> LockManager(Napi::Env env) const;
   const std::shared_ptr<std::atomic_bool>& disposed_state() const noexcept { return disposed_; }
   const Napi::ObjectReference& manager() const noexcept { return manager_; }
+  bool model_http_transport() const noexcept { return model_http_transport_; }
+  bool MayResolveDefaultVariant() const;
 
  private:
   Napi::Value GetInfo(const Napi::CallbackInfo& info);
@@ -87,6 +90,7 @@ class Model : public Napi::ObjectWrap<Model> {
   std::weak_ptr<foundry_local::Manager> manager_lifetime_;
   std::shared_ptr<std::atomic_bool> disposed_;
   Napi::ObjectReference manager_;
+  bool model_http_transport_ = false;
 };
 
 }  // namespace foundry_local_node

@@ -89,6 +89,7 @@ static Napi::Object Init(Napi::Env env, Napi::Object exports) {
   // internally — never via direct `new` from JS).
   auto* data = new foundry_local_node::AddonData();
   env.SetInstanceData<foundry_local_node::AddonData>(data);
+  data->worker_environment->Install(env);
 
   // Shared TSFN for pinned-buffer deleters — see comment on
   // AddonData::buffer_release_tsfn. The JS callback is a no-op; the real
